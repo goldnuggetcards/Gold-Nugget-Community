@@ -5,13 +5,13 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Debug route (temporary)
+// Debug route (temporary). Remove after everything is stable.
 app.get("/debug/env", (req, res) => {
   res.json({
     hasApiSecret: !!process.env.SHOPIFY_API_SECRET,
     hasAdminToken: !!process.env.SHOPIFY_ADMIN_ACCESS_TOKEN,
     shopDomain: process.env.SHOPIFY_SHOP_DOMAIN || null,
-    apiVersion: process.env.SHOPIFY_API_VERSION || null
+    apiVersion: process.env.SHOPIFY_API_VERSION || null,
   });
 });
 
@@ -26,9 +26,9 @@ app.get("/", (req, res) => {
     </ul>
   `);
 });
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ...rest of your file unchanged
 /* Env */
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
@@ -101,6 +101,16 @@ function escapeHtml(str = "") {
     .replaceAll("'", "&#039;");
 }
 
+// Important: returns HTTP 200 so Shopify shows the error details instead of a generic “third-party application” page.
+function showErrorPage(res, title, details) {
+  console.error(title, details);
+  return res.status(200).type("html").send(`
+    <h1>${escapeHtml(title)}</h1>
+    <pre style="white-space:pre-wrap;word-break:break-word;">${escapeHtml(details || "")}</pre>
+    <p><a href="/apps/community">Back</a></p>
+  `);
+}
+
 /* Landing */
 app.get("/proxy", requireProxyAuth, (req, res) => {
   res.type("html").send(`
@@ -152,11 +162,11 @@ app.get("/proxy/me", requireProxyAuth, async (req, res) => {
   try {
     data = await shopifyGraphQL(GET_PROFILE, { id: customerGid });
   } catch (e) {
-    return res.status(500).type("text").send(`Shopify API error:\n${e.message}`);
+    return showErrorPage(res, "Shopify API error (GET /me)", e?.message || String(e));
   }
 
   const mf = Object.fromEntries(
-    (data.customer.metafields || []).map((m) => [`${m.namespace}.${m.key}`, m.value])
+    (data.customer?.metafields || []).map((m) => [`${m.namespace}.${m.key}`, m.value])
   );
 
   const username = mf["profile.username"] || "";
@@ -210,7 +220,9 @@ const SET_PROFILE = `
 
 app.post("/proxy/me", requireProxyAuth, async (req, res) => {
   const customerId = req.query.logged_in_customer_id;
-  if (!customerId) return res.status(401).send("Not logged in");
+  if (!customerId) {
+    return showErrorPage(res, "Not logged in", "logged_in_customer_id was not provided by Shopify.");
+  }
 
   const username = (req.body.username || "").trim();
   const displayName = (req.body.display_name || "").trim();
@@ -219,13 +231,18 @@ app.post("/proxy/me", requireProxyAuth, async (req, res) => {
   const collectionVis = (req.body.collection_visibility || "private").trim();
 
   if (!/^[a-z0-9_]{3,20}$/.test(username)) {
-    return res
-      .status(400)
-      .type("text")
-      .send("Username must be 3-20 characters and only lowercase letters, numbers, underscore.");
+    return showErrorPage(
+      res,
+      "Validation error",
+      "Username must be 3-20 characters and only lowercase letters, numbers, underscore."
+    );
   }
-  if (!["private", "public"].includes(profileVis)) return res.status(400).send("Invalid profile visibility.");
-  if (!["private", "public"].includes(collectionVis)) return res.status(400).send("Invalid collection visibility.");
+  if (!["private", "public"].includes(profileVis)) {
+    return showErrorPage(res, "Validation error", "Invalid profile visibility.");
+  }
+  if (!["private", "public"].includes(collectionVis)) {
+    return showErrorPage(res, "Validation error", "Invalid collection visibility.");
+  }
 
   const ownerId = `gid://shopify/Customer/${customerId}`;
 
@@ -241,12 +258,12 @@ app.post("/proxy/me", requireProxyAuth, async (req, res) => {
   try {
     data = await shopifyGraphQL(SET_PROFILE, { metafields });
   } catch (e) {
-    return res.status(500).type("text").send(`Shopify API error:\n${e.message}`);
+    return showErrorPage(res, "Shopify API error (POST /me)", e?.message || String(e));
   }
 
-  const errors = data.metafieldsSet.userErrors || [];
+  const errors = data.metafieldsSet?.userErrors || [];
   if (errors.length) {
-    return res.status(400).type("text").send(`Save failed:\n${errors.map((e) => e.message).join("\n")}`);
+    return showErrorPage(res, "Save failed", errors.map((e) => e.message).join("\n"));
   }
 
   res.redirect("/apps/community/me?saved=1");
