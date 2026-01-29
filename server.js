@@ -5,13 +5,6 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-import express from "express";
-import crypto from "crypto";
-
-const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-
 app.get("/", (req, res) => {
   res.type("text").send("OK: server is running");
 });
