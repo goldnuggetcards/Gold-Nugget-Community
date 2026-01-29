@@ -6,7 +6,16 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 /* Public routes for testing Render only */
-app.get("/", (req, res) => res.type("text").send("OK: server is running"));
+app.get("/", (req, res) => {
+  res.type("html").send(`
+    <h1>Gold Nugget Community</h1>
+    <p>Server is running.</p>
+    <ul>
+      <li><a href="https://www.goldnuggetcards.com/apps/community" target="_blank" rel="noreferrer">Open Community (storefront)</a></li>
+      <li><a href="/health" target="_blank" rel="noreferrer">Health check</a></li>
+    </ul>
+  `);
+});
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 /* Env */
