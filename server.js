@@ -3,23 +3,41 @@ import crypto from "crypto";
 
 const app = express();
 
-const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET; // required
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 const PORT = process.env.PORT || 3000;
 
 function verifyShopifyProxy(req) {
-  // Shopify App Proxy uses "signature" param for verification
+  const secret = SHOPIFY_API_SECRET;
+  if (!secret) return false;
+
   const query = { ...req.query };
-  const signature = query.signature;
+
+  // App Proxy uses "signature"
+  const signature = typeof query.signature === "string" ? query.signature : "";
+  if (!signature) return false;
+
   delete query.signature;
 
-  // Build sorted query string with no separators
+  // Build sorted query string with no separators (Shopify proxy format)
   const message = Object.keys(query)
     .sort()
-    .map((key) => `${key}=${Array.isArray(query[key]) ? query[key].join(",") : query[key]}`)
+    .map((key) => {
+      const val = query[key];
+      const valueStr = Array.isArray(val) ? val.join(",") : String(val);
+      return `${key}=${valueStr}`;
+    })
     .join("");
 
-  const digest = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(message).digest("hex");
-  return digest === signature;
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(message)
+    .digest("hex");
+
+  // timing-safe compare
+  const a = Buffer.from(digest, "utf8");
+  const b = Buffer.from(signature, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 function requireProxyAuth(req, res, next) {
