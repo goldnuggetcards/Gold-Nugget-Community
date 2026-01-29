@@ -5,6 +5,16 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// Debug route (temporary)
+app.get("/debug/env", (req, res) => {
+  res.json({
+    hasApiSecret: !!process.env.SHOPIFY_API_SECRET,
+    hasAdminToken: !!process.env.SHOPIFY_ADMIN_ACCESS_TOKEN,
+    shopDomain: process.env.SHOPIFY_SHOP_DOMAIN || null,
+    apiVersion: process.env.SHOPIFY_API_VERSION || null
+  });
+});
+
 /* Public routes for testing Render only */
 app.get("/", (req, res) => {
   res.type("html").send(`
@@ -18,6 +28,7 @@ app.get("/", (req, res) => {
 });
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+// ...rest of your file unchanged
 /* Env */
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
