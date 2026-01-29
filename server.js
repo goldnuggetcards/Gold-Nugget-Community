@@ -30,7 +30,7 @@ function requireProxyAuth(req, res, next) {
 
 app.get("/proxy", requireProxyAuth, (req, res) => {
   res.type("html").send(`
-    <h1>Gold Nugget Community</h1>
+    <h1>Nugget Depot</h1>
     <p>Proxy working.</p>
     <ul>
       <li><a href="/apps/community/me">My Profile</a></li>
