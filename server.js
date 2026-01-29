@@ -12,7 +12,7 @@ const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 const PORT = process.env.PORT || 3000;
 
-/* Simple Render checks */
+/* Simple checks */
 app.get("/health", (req, res) => res.json({ ok: true }));
 app.get("/debug/env", (req, res) => {
   res.json({
@@ -57,17 +57,17 @@ function escapeHtml(str = "") {
     .replaceAll("'", "&#039;");
 }
 
-/* Minimal landing */
+/* Proxy landing */
 app.get("/proxy", requireProxyAuth, (req, res) => {
   res.type("html").send(`
     <h1>Gold Nugget Community</h1>
     <ul>
-      <li><a href="/apps/community/me">Token Test (Me)</a></li>
+      <li><a href="/apps/community/me">My Profile</a></li>
     </ul>
   `);
 });
 
-/* Minimal token test */
+/* Minimal token test at /me */
 app.get("/proxy/me", requireProxyAuth, async (req, res) => {
   const customerId = req.query.logged_in_customer_id;
 
@@ -79,21 +79,9 @@ app.get("/proxy/me", requireProxyAuth, async (req, res) => {
     `);
   }
 
-  if (!SHOPIFY_ADMIN_ACCESS_TOKEN) {
-    return res.type("html").send(`<h1>Me</h1><pre>Missing SHOPIFY_ADMIN_ACCESS_TOKEN</pre>`);
-  }
-  if (!SHOPIFY_SHOP_DOMAIN) {
-    return res.type("html").send(`<h1>Me</h1><pre>Missing SHOPIFY_SHOP_DOMAIN</pre>`);
-  }
-
-  const query = `
-    query GetCustomerEmail($id: ID!) {
-      customer(id: $id) { id email }
-    }
-  `;
-  const variables = { id: `gid://shopify/Customer/${customerId}` };
-
   const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+  const query = `query ($id: ID!) { customer(id: $id) { id email } }`;
+  const variables = { id: `gid://shopify/Customer/${customerId}` };
 
   try {
     const resp = await fetch(url, {
@@ -107,16 +95,15 @@ app.get("/proxy/me", requireProxyAuth, async (req, res) => {
 
     const text = await resp.text();
 
-    // Always return 200 so Shopify shows it.
     return res.status(200).type("html").send(`
-      <h1>Token Test Result</h1>
+      <h1>Me (Token Test)</h1>
       <p>Status: ${resp.status}</p>
       <pre style="white-space:pre-wrap;word-break:break-word;">${escapeHtml(text)}</pre>
       <p><a href="/apps/community">Back</a></p>
     `);
   } catch (e) {
     return res.status(200).type("html").send(`
-      <h1>Token Test Result</h1>
+      <h1>Me (Token Test)</h1>
       <pre style="white-space:pre-wrap;word-break:break-word;">${escapeHtml(e?.message || String(e))}</pre>
       <p><a href="/apps/community">Back</a></p>
     `);
