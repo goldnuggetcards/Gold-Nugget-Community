@@ -2,11 +2,13 @@
   "name": "gnc-community-proxy",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.0"
-    "engines": { "node": "22.x" }
   }
 }
