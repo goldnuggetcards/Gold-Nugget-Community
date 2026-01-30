@@ -19,7 +19,6 @@ const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
-      // Works for Render Postgres
       ssl: { rejectUnauthorized: false },
     })
   : null;
@@ -58,7 +57,6 @@ function verifyShopifyProxy(req) {
   delete query.signature;
 
   const message = buildProxyMessage(query);
-
   const digest = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(message).digest("hex");
 
   const a = Buffer.from(digest, "utf8");
@@ -131,9 +129,7 @@ proxy.use(requireProxyAuth);
 
 proxy.get("/", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res
-    .type("html")
-    .send(page("Nugget Depot", `<p>Proxy working.</p><p>Use the navigation above.</p>`, shop));
+  res.type("html").send(page("Nugget Depot", `<p>Proxy working.</p><p>Use the navigation above.</p>`, shop));
 });
 
 function cleanUsername(input) {
@@ -164,23 +160,20 @@ async function setUsername(shop, customerId, username) {
   );
 }
 
-proxy.get("/me", async (req, res) => {
+function signedQueryString(req) {
+  // Keep all existing proxy params so the save request is signed
+  return new URLSearchParams(req.query).toString();
+}
+
+async function renderProfile(req, res, { saved = false, invalid = false } = {}) {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-  const saved = req.query.saved === "1";
-  const err = req.query.err === "1";
 
   if (!customerId) {
     return res
       .type("html")
-      .send(
-        page(
-          "My Profile",
-          `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`,
-          shop
-        )
-      );
+      .send(page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
   }
 
   const username = await getUsername(shop, customerId);
@@ -191,14 +184,13 @@ proxy.get("/me", async (req, res) => {
 
   const status = saved
     ? `<p class="ok">Saved.</p>`
-    : err
+    : invalid
       ? `<p class="error">Invalid username.</p>`
       : "";
 
-  // IMPORTANT: carry forward the signed proxy query params so POST is still signed
-  const signedQs = new URLSearchParams(req.query).toString();
+  const qs = signedQueryString(req);
 
-  res.type("html").send(
+  return res.type("html").send(
     page(
       "My Profile",
       `
@@ -210,7 +202,8 @@ proxy.get("/me", async (req, res) => {
           <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
         </div>
 
-        <form method="POST" action="/apps/nuggetdepot/me/username?${signedQs}">
+        <!-- Use GET because Shopify App Proxy often does not forward POST -->
+        <form method="GET" action="/apps/nuggetdepot/me/username?${qs}">
           <label for="username">Set username</label>
           <input id="username" name="username" placeholder="ex: nuggetking" value="${username || ""}" />
           <div class="muted">3–20 characters. Letters, numbers, underscore, dash, dot.</div>
@@ -220,9 +213,14 @@ proxy.get("/me", async (req, res) => {
       shop
     )
   );
+}
+
+proxy.get("/me", async (req, res) => {
+  return renderProfile(req, res);
 });
 
-proxy.post("/me/username", async (req, res) => {
+// Save username via GET (signed)
+proxy.get("/me/username", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
@@ -231,14 +229,14 @@ proxy.post("/me/username", async (req, res) => {
     return res.status(401).type("html").send(page("My Profile", `<p>You are not logged in.</p>`, shop));
   }
 
-  const username = cleanUsername(req.body?.username);
+  const username = cleanUsername(req.query.username);
   if (!username) {
-    return res.redirect("/apps/nuggetdepot/me?err=1");
+    return renderProfile(req, res, { invalid: true });
   }
 
   try {
     await setUsername(shop, customerId, username);
-    return res.redirect("/apps/nuggetdepot/me?saved=1");
+    return renderProfile(req, res, { saved: true });
   } catch (e) {
     console.error(e);
     return res
