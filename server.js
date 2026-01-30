@@ -1,4 +1,9 @@
 // server.js (FULL FILE REPLACEMENT)
+// Changes:
+// - Ensure avatar upload always creates row first
+// - Save on /me/edit redirects back to /me/edit?saved=1 so the edit page confirms save
+// - "Done" button on edit page goes back to /me (profile) and shows updates there
+
 import express from "express";
 import crypto from "crypto";
 import { Pool } from "pg";
@@ -9,7 +14,6 @@ app.disable("x-powered-by");
 
 app.use(express.urlencoded({ extended: false }));
 
-// Status + timing logger (helps diagnose Shopify proxy errors)
 app.use((req, res, next) => {
   const start = Date.now();
   res.on("finish", () => {
@@ -30,7 +34,6 @@ const pool = DATABASE_URL
     })
   : null;
 
-// Multer in-memory uploads
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
@@ -39,7 +42,6 @@ const upload = multer({
 async function ensureSchema() {
   if (!pool) return;
 
-  // Base table (create if missing)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS profiles_v2 (
       customer_id TEXT PRIMARY KEY,
@@ -52,7 +54,6 @@ async function ensureSchema() {
     );
   `);
 
-  // Add fields we need for profile display
   await pool.query(
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
   );
@@ -60,19 +61,16 @@ async function ensureSchema() {
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
   );
 
-  // Bio + social link
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`);
   await pool.query(
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
   );
 
-  // Avatar stored in DB (MVP)
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
   await pool.query(
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
   );
 
-  // Keep older columns safe (no-op if already present)
   await pool.query(
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`
   );
@@ -84,7 +82,6 @@ async function ensureSchema() {
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`
   );
 
-  // Repair older tables created without defaults (prevents NULL insert failures)
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET DEFAULT ''`);
@@ -94,7 +91,6 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET DEFAULT ''`);
 
-  // Backfill any existing NULLs
   await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
   await pool.query(
@@ -106,7 +102,6 @@ async function ensureSchema() {
   await pool.query(`UPDATE profiles_v2 SET social_url = '' WHERE social_url IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET avatar_mime = '' WHERE avatar_mime IS NULL`);
 
-  // Re-assert NOT NULL (in case older schema differed)
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET NOT NULL`);
@@ -160,8 +155,6 @@ function page(_title, bodyHtml, shop, nav = true) {
       .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:860px}
       code{background:#f5f5f5;padding:2px 6px;border-radius:6px}
       .muted{opacity:.75}
-      .grid{display:grid;grid-template-columns:180px 1fr;gap:8px 16px;margin-top:12px}
-      .k{opacity:.75}
       .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;background:white;cursor:pointer}
       input, textarea{padding:10px 12px;border:1px solid #ddd;border-radius:10px;width:100%;max-width:520px;font:inherit}
       textarea{min-height:110px;resize:vertical}
@@ -172,65 +165,12 @@ function page(_title, bodyHtml, shop, nav = true) {
       .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
       .center{max-width:520px}
 
-      /* Center profile + move it up */
-      .profileTop{
-        display:flex;
-        flex-direction:column;
-        align-items:center;
-        justify-content:flex-start;
-        gap:14px;
-      }
-      .avatarWrap{
-        width:100%;
-        display:flex;
-        flex-direction:column;
-        align-items:center;
-        margin-top:6px;
-      }
-
-      /* Avatar with overlay edit button */
-      .avatarBox{
-        position:relative;
-        width:120px;
-        height:120px;
-      }
-      .avatar{
-        width:120px;height:120px;
-        border-radius:16px;
-        object-fit:cover;
-        aspect-ratio:1/1;
-        border:1px solid #ddd;
-        background:#fafafa;
-        display:block;
-      }
-      .avatarEdit{
-        position:absolute;
-        right:-8px;
-        bottom:-8px;
-        width:34px;
-        height:34px;
-        border-radius:10px;
-        border:1px solid #ddd;
-        background:#fff;
-        display:flex;
-        align-items:center;
-        justify-content:center;
-        cursor:pointer;
-        box-shadow:0 2px 10px rgba(0,0,0,.06);
-        text-decoration:none;
-      }
-      .fileInput{
-        position:absolute;
-        width:1px;
-        height:1px;
-        padding:0;
-        margin:-1px;
-        overflow:hidden;
-        clip:rect(0,0,0,0);
-        white-space:nowrap;
-        border:0;
-      }
-
+      .profileTop{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:14px}
+      .avatarWrap{width:100%;display:flex;flex-direction:column;align-items:center;margin-top:6px}
+      .avatarBox{position:relative;width:120px;height:120px}
+      .avatar{width:120px;height:120px;border-radius:16px;object-fit:cover;aspect-ratio:1/1;border:1px solid #ddd;background:#fafafa;display:block}
+      .avatarEdit{position:absolute;right:-8px;bottom:-8px;width:34px;height:34px;border-radius:10px;border:1px solid #ddd;background:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.06);text-decoration:none}
+      .fileInput{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
       .nameUnder{margin-top:10px;font-weight:800}
       .handleUnder{margin-top:4px}
       .small{font-size:13px}
@@ -255,7 +195,6 @@ function page(_title, bodyHtml, shop, nav = true) {
 </html>`;
 }
 
-// Return HTML on auth failure so Shopify does not show the generic third party error page
 function requireProxyAuth(req, res, next) {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
 
@@ -350,7 +289,6 @@ async function ensureRow(customerId, shop) {
   if (!pool) throw new Error("DB not configured");
   await ensureSchema();
 
-  // Insert safe defaults for NOT NULL columns so older schemas cannot fail
   await pool.query(
     `INSERT INTO profiles_v2 (
         customer_id, shop,
@@ -386,7 +324,6 @@ async function updateProfile(customerId, patch) {
   );
 }
 
-/** Non-proxy root */
 app.get("/", (req, res) => {
   res.type("html").send(`
     <h1>Nugget Depot</h1>
@@ -400,11 +337,9 @@ app.get("/", (req, res) => {
 
 app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 
-/** Proxy */
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
-/** FEED (placeholder) */
 proxy.get("/", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -431,7 +366,6 @@ proxy.get("/", async (req, res) => {
   );
 });
 
-/** Avatar image endpoint (img src must include signed query string) */
 proxy.get("/me/avatar", async (req, res) => {
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
@@ -458,7 +392,6 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
-/** PROFILE PAGE (clean header, no titles, no forms) */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -489,15 +422,6 @@ proxy.get("/me", async (req, res) => {
     ? `<div class="muted handleUnder">${handle}</div>`
     : `<div class="muted handleUnder">Username not set</div>`;
 
-  const status =
-    req.query.saved === "1"
-      ? `<p class="ok">Saved.</p>`
-      : req.query.err === "1"
-        ? `<p class="error">Please check your inputs.</p>`
-        : req.query.imgerr === "1"
-          ? `<p class="error">Upload a PNG, JPG, or WEBP under 2MB.</p>`
-          : "";
-
   const avatarSrc = `/apps/nuggetdepot/me/avatar?${qs}`;
   const editHref = `/apps/nuggetdepot/me/edit?${qs}`;
 
@@ -505,8 +429,6 @@ proxy.get("/me", async (req, res) => {
     page(
       "My Profile",
       `
-        ${status}
-
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
@@ -528,7 +450,6 @@ proxy.get("/me", async (req, res) => {
   );
 });
 
-/** EDIT BIO PAGE */
 proxy.get("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -637,7 +558,6 @@ proxy.get("/me/edit", async (req, res) => {
   );
 });
 
-/** Save edit profile fields */
 proxy.post("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -657,15 +577,15 @@ proxy.post("/me/edit", async (req, res) => {
   try {
     await ensureRow(customerId, shop);
     await updateProfile(customerId, { first_name, last_name, social_url, bio });
-    return res.redirect(`/apps/nuggetdepot/me?saved=1&${qs}`);
+    return res.redirect(`/apps/nuggetdepot/me/edit?saved=1&${qs}`);
   } catch (e) {
     console.error("edit save error:", e);
     return res.redirect(`/apps/nuggetdepot/me/edit?err=1&${qs}`);
   }
 });
 
-/** Upload avatar */
 proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
@@ -682,6 +602,7 @@ proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
     return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
 
   try {
+    await ensureRow(customerId, shop);
     await updateProfile(customerId, {
       avatar_bytes: file.buffer,
       avatar_mime: file.mimetype,
