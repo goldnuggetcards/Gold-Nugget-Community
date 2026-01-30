@@ -53,22 +53,36 @@ async function ensureSchema() {
   `);
 
   // Add fields we need for profile display
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
+  );
 
   // Bio + social link
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
+  );
 
   // Avatar stored in DB (MVP)
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
+  );
 
   // Keep older columns safe (no-op if already present)
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`
+  );
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS dob DATE`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`
+  );
 
   // Repair older tables created without defaults (prevents NULL insert failures)
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET DEFAULT ''`);
@@ -83,7 +97,9 @@ async function ensureSchema() {
   // Backfill any existing NULLs
   await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`);
+  await pool.query(
+    `UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`
+  );
   await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
@@ -244,9 +260,10 @@ function requireProxyAuth(req, res, next) {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
 
   if (!SHOPIFY_API_SECRET) {
-    return res.status(200).type("html").send(
-      page("Config error", `<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop)
-    );
+    return res
+      .status(200)
+      .type("html")
+      .send(page("Config error", `<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop));
   }
 
   if (!verifyShopifyProxy(req)) {
@@ -468,7 +485,9 @@ proxy.get("/me", async (req, res) => {
   const displayName = `${first} ${last}`.trim() || "Name not set";
 
   const handle = safeHandle(profile?.username);
-  const handleLine = handle ? `<div class="muted handleUnder">${handle}</div>` : `<div class="muted handleUnder">Username not set</div>`;
+  const handleLine = handle
+    ? `<div class="muted handleUnder">${handle}</div>`
+    : `<div class="muted handleUnder">Username not set</div>`;
 
   const status =
     req.query.saved === "1"
@@ -538,10 +557,21 @@ proxy.get("/me/edit", async (req, res) => {
 
   const avatarSrc = `/apps/nuggetdepot/me/avatar?${qs}`;
 
+  const status =
+    req.query.saved === "1"
+      ? `<p class="ok">Saved.</p>`
+      : req.query.err === "1"
+        ? `<p class="error">Please check your inputs.</p>`
+        : req.query.imgerr === "1"
+          ? `<p class="error">Upload a PNG, JPG, or WEBP under 2MB.</p>`
+          : "";
+
   return res.type("html").send(
     page(
       "Edit Profile",
       `
+        ${status}
+
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
@@ -644,10 +674,12 @@ proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const file = req.file;
-  if (!file || !file.buffer || !file.mimetype) return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
+  if (!file || !file.buffer || !file.mimetype)
+    return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
 
   const allowed = new Set(["image/png", "image/jpeg", "image/webp"]);
-  if (!allowed.has(file.mimetype)) return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
+  if (!allowed.has(file.mimetype))
+    return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
 
   try {
     await updateProfile(customerId, {
