@@ -56,19 +56,31 @@ async function ensureSchema() {
     );
   `);
 
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
+  );
 
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
+  );
 
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
+  );
 
   // Backfill NULLs for older schemas
   await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`);
+  await pool.query(
+    `UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`
+  );
   await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
@@ -121,35 +133,6 @@ function verifyShopifyProxy(req) {
   const a = Buffer.from(digest, "utf8");
   const b = Buffer.from(signature, "utf8");
   return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-function requireProxyAuth(req, res, next) {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-
-  if (!SHOPIFY_API_SECRET) {
-    return res.status(200).type("html").send(
-      page("", `<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop, true, req)
-    );
-  }
-
-  if (!verifyShopifyProxy(req)) {
-    const keys = Object.keys(req.query || {}).sort().join(", ");
-    return res.status(200).type("html").send(
-      page(
-        "",
-        `
-          <p class="error">Invalid proxy signature.</p>
-          <p class="muted">Path: <code>${req.originalUrl}</code></p>
-          <p class="muted">Query keys: <code>${keys || "none"}</code></p>
-        `,
-        shop,
-        true,
-        req
-      )
-    );
-  }
-
-  return next();
 }
 
 function basePathFromReq(req) {
@@ -211,6 +194,36 @@ function page(_title, bodyHtml, shop, nav = true, reqForBase = null) {
     </div>
   </body>
 </html>`;
+}
+
+function requireProxyAuth(req, res, next) {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+
+  if (!SHOPIFY_API_SECRET) {
+    return res
+      .status(200)
+      .type("html")
+      .send(page("", `<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop, true, req));
+  }
+
+  if (!verifyShopifyProxy(req)) {
+    const keys = Object.keys(req.query || {}).sort().join(", ");
+    return res.status(200).type("html").send(
+      page(
+        "",
+        `
+          <p class="error">Invalid proxy signature.</p>
+          <p class="muted">Path: <code>${req.originalUrl}</code></p>
+          <p class="muted">Query keys: <code>${keys || "none"}</code></p>
+        `,
+        shop,
+        true,
+        req
+      )
+    );
+  }
+
+  return next();
 }
 
 function cleanText(input, max = 80) {
@@ -325,22 +338,22 @@ proxy.use(requireProxyAuth);
 /** Feed */
 proxy.get("/", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
   if (!customerId) {
-    return res.type("html").send(
-      page("", `<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req)
-    );
+    return res
+      .type("html")
+      .send(page("", `<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req));
   }
 
-  return res.type("html").send(
-    page("", `<p>Feed placeholder.</p>`, shop, true, req)
-  );
+  return res.type("html").send(page("", `<p>Feed placeholder.</p>`, shop, true, req));
 });
 
 /** Avatar */
 proxy.get("/me/avatar", async (req, res) => {
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   if (!customerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
@@ -366,24 +379,26 @@ proxy.get("/me/avatar", async (req, res) => {
 /** My Profile */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const base = basePathFromReq(req);
 
   if (!customerId) {
-    return res.type("html").send(
-      page("", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req)
-    );
+    return res
+      .type("html")
+      .send(page("", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req));
   }
   if (!pool) {
-    return res.type("html").send(
-      page("", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, true, req)
-    );
+    return res
+      .type("html")
+      .send(page("", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, true, req));
   }
 
   await ensureRow(customerId, shop);
 
   const profile = await getProfile(customerId);
-  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const displayName =
+    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
 
   const handle = safeHandle(profile?.username);
   const handleLine = handle
@@ -419,18 +434,19 @@ proxy.get("/me", async (req, res) => {
 /** Edit */
 proxy.get("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const base = basePathFromReq(req);
 
   if (!customerId) {
-    return res.type("html").send(
-      page("", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req)
-    );
+    return res
+      .type("html")
+      .send(page("", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req));
   }
   if (!pool) {
-    return res.type("html").send(
-      page("", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, true, req)
-    );
+    return res
+      .type("html")
+      .send(page("", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, true, req));
   }
 
   await ensureRow(customerId, shop);
@@ -519,7 +535,8 @@ proxy.get("/me/edit", async (req, res) => {
 
 proxy.post("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const base = basePathFromReq(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -544,7 +561,8 @@ proxy.post("/me/edit", async (req, res) => {
 
 proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const base = basePathFromReq(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
