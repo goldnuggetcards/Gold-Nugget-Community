@@ -2,24 +2,13 @@ import express from "express";
 import crypto from "crypto";
 
 const app = express();
+app.disable("x-powered-by");
 
-const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
-const PORT = process.env.PORT || 3000;
+const { SHOPIFY_API_SECRET } = process.env;
+const PORT = Number(process.env.PORT) || 3000;
 
-function verifyShopifyProxy(req) {
-  const secret = SHOPIFY_API_SECRET;
-  if (!secret) return false;
-
-  const query = { ...req.query };
-
-  // App Proxy uses "signature"
-  const signature = typeof query.signature === "string" ? query.signature : "";
-  if (!signature) return false;
-
-  delete query.signature;
-
-  // Build sorted query string with no separators (Shopify proxy format)
-  const message = Object.keys(query)
+function buildProxyMessage(query) {
+  return Object.keys(query)
     .sort()
     .map((key) => {
       const val = query[key];
@@ -27,26 +16,41 @@ function verifyShopifyProxy(req) {
       return `${key}=${valueStr}`;
     })
     .join("");
+}
+
+function verifyShopifyProxy(req) {
+  if (!SHOPIFY_API_SECRET) return false;
+
+  const query = { ...req.query };
+  const signature = typeof query.signature === "string" ? query.signature : "";
+  if (!signature) return false;
+  delete query.signature;
+
+  const message = buildProxyMessage(query);
 
   const digest = crypto
-    .createHmac("sha256", secret)
+    .createHmac("sha256", SHOPIFY_API_SECRET)
     .update(message)
     .digest("hex");
 
-  // timing-safe compare
   const a = Buffer.from(digest, "utf8");
   const b = Buffer.from(signature, "utf8");
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 function requireProxyAuth(req, res, next) {
-  if (!SHOPIFY_API_SECRET) return res.status(500).send("Missing SHOPIFY_API_SECRET");
-  if (!verifyShopifyProxy(req)) return res.status(401).send("Invalid proxy signature");
+  if (!SHOPIFY_API_SECRET) return res.status(500).type("text").send("Missing SHOPIFY_API_SECRET");
+  if (!verifyShopifyProxy(req)) return res.status(401).type("text").send("Invalid proxy signature");
   next();
 }
 
-app.get("/proxy", requireProxyAuth, (req, res) => {
+// Health check for Render (and quick sanity test)
+app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
+
+const proxy = express.Router();
+proxy.use(requireProxyAuth);
+
+proxy.get("/", (req, res) => {
   res.type("html").send(`
     <h1>Nugget Depot</h1>
     <p>Proxy working.</p>
@@ -58,16 +62,24 @@ app.get("/proxy", requireProxyAuth, (req, res) => {
   `);
 });
 
-app.get("/proxy/me", requireProxyAuth, (req, res) => {
+proxy.get("/me", (req, res) => {
   res.type("html").send("<h1>My Profile</h1><p>Placeholder</p>");
 });
 
-app.get("/proxy/collection", requireProxyAuth, (req, res) => {
+proxy.get("/collection", (req, res) => {
   res.type("html").send("<h1>My Collection</h1><p>Placeholder</p>");
 });
 
-app.get("/proxy/trades", requireProxyAuth, (req, res) => {
+proxy.get("/trades", (req, res) => {
   res.type("html").send("<h1>Trades</h1><p>Placeholder</p>");
 });
 
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+// Mount router so your proxy URL can be set to https://YOUR_SERVER/proxy
+app.use("/proxy", proxy);
+
+// Optional: nicer 404 for anything else
+app.use((req, res) => res.status(404).type("text").send("Not found"));
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on ${PORT}`);
+});
