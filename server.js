@@ -1,3 +1,4 @@
+// server.js (FULL FILE REPLACEMENT)
 import express from "express";
 import crypto from "crypto";
 import { Pool } from "pg";
@@ -52,18 +53,30 @@ async function ensureSchema() {
   `);
 
   // Add fields we need for profile display
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
+  );
 
   // Avatar stored in DB (MVP)
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
+  );
 
   // Keep older columns safe (no-op if already present)
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`
+  );
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS dob DATE`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`
+  );
 
   // Repair older tables created without defaults (prevents NULL insert failures)
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET DEFAULT ''`);
@@ -203,7 +216,7 @@ function page(title, bodyHtml, shop, nav = true) {
       }
 
       .nameUnder{margin-top:10px;font-weight:700}
-      .subUnder{margin-top:2px}
+      .subUnder{margin-top:4px}
       .small{font-size:13px}
     </style>
   </head>
@@ -231,11 +244,7 @@ function requireProxyAuth(req, res, next) {
 
   if (!SHOPIFY_API_SECRET) {
     return res.status(200).type("html").send(
-      page(
-        "Config error",
-        `<p class="error">Missing SHOPIFY_API_SECRET</p>`,
-        shop
-      )
+      page("Config error", `<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop)
     );
   }
 
@@ -370,7 +379,8 @@ proxy.use(requireProxyAuth);
 /** FEED (placeholder) */
 proxy.get("/", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
   if (!customerId) {
     return res.type("html").send(
@@ -395,7 +405,8 @@ proxy.get("/", async (req, res) => {
 
 /** Avatar image endpoint (img src must include signed query string) */
 proxy.get("/me/avatar", async (req, res) => {
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
@@ -422,27 +433,20 @@ proxy.get("/me/avatar", async (req, res) => {
 /** PROFILE PAGE */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
   if (!customerId) {
     return res.type("html").send(
-      page(
-        "My Profile",
-        `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`,
-        shop
-      )
+      page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop)
     );
   }
 
   if (!pool) {
-    return res.type("html").send(
-      page(
-        "My Profile",
-        `<p class="error">DATABASE_URL not set. Add it on Render.</p>`,
-        shop
-      )
-    );
+    return res
+      .type("html")
+      .send(page("My Profile", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop));
   }
 
   await ensureRow(customerId, shop);
@@ -488,15 +492,12 @@ proxy.get("/me", async (req, res) => {
             </div>
 
             <div class="nameUnder">${displayName}</div>
-            <div class="muted subUnder small">Community profile</div>
+            <div class="muted subUnder small">
+              ${profile?.username ? `@${profile.username}` : `<span class="muted">Username not set</span>`}
+            </div>
           </div>
 
           <div style="min-width:260px;flex:1;width:100%;max-width:520px">
-            <div class="grid">
-              <div class="k">Customer ID</div><div><code>${customerId}</code></div>
-              <div class="k">Username</div><div>${profile?.username ? `<strong>${profile.username}</strong>` : `<span class="muted">Not set</span>`}</div>
-            </div>
-
             <hr/>
 
             <h3 style="margin:0 0 6px 0">Update name</h3>
@@ -535,7 +536,8 @@ proxy.get("/me", async (req, res) => {
 /** Save first/last name */
 proxy.post("/me/name", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -558,7 +560,8 @@ proxy.post("/me/name", async (req, res) => {
 
 /** Upload avatar */
 proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
-  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
