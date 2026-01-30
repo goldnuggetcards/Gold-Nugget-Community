@@ -171,13 +171,17 @@ async function ensureSchema() {
   `);
 
   // Ensure new bucket column exists if older table already created
-  await pool.query(`ALTER TABLE posts_v1 ADD COLUMN IF NOT EXISTS bucket TEXT NOT NULL DEFAULT 'feed'`);
+  await pool.query(
+    `ALTER TABLE posts_v1 ADD COLUMN IF NOT EXISTS bucket TEXT NOT NULL DEFAULT 'feed'`
+  );
 
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET DEFAULT ''`);
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET DEFAULT ''`);
   await pool.query(`UPDATE posts_v1 SET body = '' WHERE body IS NULL`);
   await pool.query(`UPDATE posts_v1 SET media_mime = '' WHERE media_mime IS NULL`);
-  await pool.query(`UPDATE posts_v1 SET bucket = 'feed' WHERE bucket IS NULL OR bucket = ''`);
+  await pool.query(
+    `UPDATE posts_v1 SET bucket = 'feed' WHERE bucket IS NULL OR bucket = ''`
+  );
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET NOT NULL`);
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET NOT NULL`);
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN bucket SET NOT NULL`);
@@ -215,7 +219,9 @@ async function ensureSchema() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS likes_v1_post_idx ON likes_v1 (post_id)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS likes_v1_customer_idx ON likes_v1 (customer_id)`);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS likes_v1_customer_idx ON likes_v1 (customer_id)`
+  );
 
   // Comments
   await pool.query(`
@@ -261,7 +267,10 @@ function verifyShopifyProxy(req) {
   delete query.signature;
 
   const message = buildProxyMessage(query);
-  const digest = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(message).digest("hex");
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_API_SECRET)
+    .update(message)
+    .digest("hex");
 
   const a = Buffer.from(digest, "utf8");
   const b = Buffer.from(signature, "utf8");
@@ -290,7 +299,11 @@ function parseCookies(req) {
 
 function b64urlEncode(input) {
   const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input), "utf8");
-  return buf.toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return buf
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
 }
 
 function b64urlDecodeToString(s) {
@@ -873,7 +886,6 @@ function page(bodyHtml, reqForBase) {
           const t = e.target;
           if (!(t instanceof HTMLElement)) return;
 
-          // open from media tile or inner media
           const tile = t.closest && t.closest('[data-lb-open="1"]');
           if (tile){
             const group = tile.getAttribute('data-lb-group') || '';
@@ -926,9 +938,13 @@ function requireProxyAuth(req, res, next) {
   if (verifyShopifyProxy(req)) {
     const shop = typeof req.query.shop === "string" ? req.query.shop : "";
     const customerId =
-      typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+      typeof req.query.logged_in_customer_id === "string"
+        ? req.query.logged_in_customer_id
+        : "";
     const pathPrefix =
-      typeof req.query.path_prefix === "string" ? req.query.path_prefix : "/apps/nuggetdepot";
+      typeof req.query.path_prefix === "string"
+        ? req.query.path_prefix
+        : "/apps/nuggetdepot";
     if (shop && customerId && pathPrefix) {
       setAuthCookie(res, { shop, customer_id: customerId, path_prefix: pathPrefix });
     }
@@ -1073,19 +1089,16 @@ async function getPostMediaRow(postId, idx) {
   const i = Number(idx);
   if (!Number.isFinite(i) || i < 0) return null;
 
-  // New multi-media table
   const r = await pool.query(
     `SELECT media_bytes, media_mime FROM post_media_v1 WHERE post_id=$1 AND idx=$2`,
     [postId, i]
   );
   if (r.rows?.[0]?.media_bytes && r.rows?.[0]?.media_mime) return r.rows[0];
 
-  // Backward compat: legacy single media columns in posts_v1 (only idx 0)
   if (i === 0) {
-    const legacy = await pool.query(
-      `SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`,
-      [postId]
-    );
+    const legacy = await pool.query(`SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`, [
+      postId,
+    ]);
     if (legacy.rows?.[0]?.media_bytes && legacy.rows?.[0]?.media_mime) return legacy.rows[0];
   }
 
@@ -1100,7 +1113,6 @@ async function getPostMediaMeta(postIds) {
   if (!pool || postIds.length === 0) return { byPostId };
   await ensureSchema();
 
-  // Count new media
   const r = await pool.query(
     `SELECT post_id, COUNT(*)::int AS cnt
      FROM post_media_v1
@@ -1112,7 +1124,6 @@ async function getPostMediaMeta(postIds) {
     if (byPostId[row.post_id]) byPostId[row.post_id].media_count = Number(row.cnt) || 0;
   }
 
-  // Pull mime list (up to MAX_MEDIA_FILES) for rendering
   const r2 = await pool.query(
     `SELECT post_id, idx, media_mime
      FROM post_media_v1
@@ -1128,7 +1139,6 @@ async function getPostMediaMeta(postIds) {
     });
   }
 
-  // Backward compat for old posts: if no post_media rows, infer 1 media from posts_v1.media_mime
   const legacy = await pool.query(
     `SELECT id, media_mime
      FROM posts_v1
@@ -1153,7 +1163,6 @@ async function listPostsForCustomerWithMeta({ targetCustomerId, viewerCustomerId
   if (!pool) return { posts: [], nextCursor: "" };
   await ensureSchema();
 
-  // Profile pages show ONLY feed bucket posts
   const r = await pool.query(
     `
     SELECT
@@ -1189,7 +1198,13 @@ async function listPostsForCustomerWithMeta({ targetCustomerId, viewerCustomerId
   };
 }
 
-async function listBucketPostsWithMeta({ shop, viewerCustomerId, bucket = "feed", limit = 20, cursor = null }) {
+async function listBucketPostsWithMeta({
+  shop,
+  viewerCustomerId,
+  bucket = "feed",
+  limit = 20,
+  cursor = null,
+}) {
   if (!pool) return { posts: [], nextCursor: "" };
   await ensureSchema();
 
@@ -1240,11 +1255,15 @@ async function listBucketPostsWithMeta({ shop, viewerCustomerId, bucket = "feed"
 async function getPostsMeta(postIds, viewerCustomerId) {
   const byPostId = {};
   for (const id of postIds) {
-    byPostId[id] = { like_count: 0, comment_count: 0, viewer_liked: false, comments_preview: [] };
+    byPostId[id] = {
+      like_count: 0,
+      comment_count: 0,
+      viewer_liked: false,
+      comments_preview: [],
+    };
   }
   if (!pool || postIds.length === 0) return { byPostId };
 
-  // Likes count
   const likesR = await pool.query(
     `SELECT post_id, COUNT(*)::int AS cnt
      FROM likes_v1
@@ -1256,7 +1275,6 @@ async function getPostsMeta(postIds, viewerCustomerId) {
     if (byPostId[row.post_id]) byPostId[row.post_id].like_count = Number(row.cnt) || 0;
   }
 
-  // Viewer liked
   if (viewerCustomerId) {
     const viewerR = await pool.query(
       `SELECT post_id
@@ -1269,7 +1287,6 @@ async function getPostsMeta(postIds, viewerCustomerId) {
     }
   }
 
-  // Comment counts
   const cCountR = await pool.query(
     `SELECT post_id, COUNT(*)::int AS cnt
      FROM comments_v1
@@ -1281,7 +1298,6 @@ async function getPostsMeta(postIds, viewerCustomerId) {
     if (byPostId[row.post_id]) byPostId[row.post_id].comment_count = Number(row.cnt) || 0;
   }
 
-  // Preview last 2 comments (author + body)
   const cR = await pool.query(
     `
     SELECT * FROM (
@@ -1326,7 +1342,10 @@ async function toggleLike({ shop, postId, customerId }) {
     ]);
     return { liked: true };
   } catch {
-    await pool.query(`DELETE FROM likes_v1 WHERE post_id=$1 AND customer_id=$2`, [postId, customerId]);
+    await pool.query(`DELETE FROM likes_v1 WHERE post_id=$1 AND customer_id=$2`, [
+      postId,
+      customerId,
+    ]);
     return { liked: false };
   }
 }
@@ -1396,39 +1415,43 @@ function renderPostMediaHtml({ base, post }) {
   if (!count || !types.length) return "";
 
   const group = `post-${id}`;
-  const tiles = types.slice(0, MAX_MEDIA_FILES).map((t) => {
-    const idx = Number(t.idx) || 0;
-    const mime = String(t.mime || "");
-    const src = `${base}/posts/${id}/media/${idx}`;
-    const isVid = isVideoMime(mime);
-    const badge = count > 1 ? `<div class="mediaBadge">${count}</div>` : "";
+  const tiles = types
+    .slice(0, MAX_MEDIA_FILES)
+    .map((t) => {
+      const idx = Number(t.idx) || 0;
+      const mime = String(t.mime || "");
+      const src = `${base}/posts/${id}/media/${idx}`;
+      const isVid = isVideoMime(mime);
+      const badge = count > 1 ? `<div class="mediaBadge">${count}</div>` : "";
 
-    if (isVid) {
-      // Video tile still opens in lightbox, but show a poster-less preview (controls off in tile)
-      return `
+      if (isVid) {
+        return `
         <div class="mediaTile" data-lb-open="1" data-lb-group="${group}" data-lb-idx="${idx}" data-lb-src="${src}" data-lb-type="video">
           ${badge}
           <video muted playsinline preload="metadata" src="${src}"></video>
         </div>
       `;
-    }
+      }
 
-    return `
+      return `
       <div class="mediaTile" data-lb-open="1" data-lb-group="${group}" data-lb-idx="${idx}" data-lb-src="${src}" data-lb-type="image">
         ${badge}
         <img src="${src}" alt="Post media" />
       </div>
     `;
-  }).join("");
+    })
+    .join("");
 
-  // Also add hidden media nodes for lightbox to discover all items
-  const hiddenAll = types.slice(0, MAX_MEDIA_FILES).map((t) => {
-    const idx = Number(t.idx) || 0;
-    const mime = String(t.mime || "");
-    const src = `${base}/posts/${id}/media/${idx}`;
-    const type = isVideoMime(mime) ? "video" : "image";
-    return `<span style="display:none" data-lb-group="${group}" data-lb-src="${src}" data-lb-type="${type}"></span>`;
-  }).join("");
+  const hiddenAll = types
+    .slice(0, MAX_MEDIA_FILES)
+    .map((t) => {
+      const idx = Number(t.idx) || 0;
+      const mime = String(t.mime || "");
+      const src = `${base}/posts/${id}/media/${idx}`;
+      const type = isVideoMime(mime) ? "video" : "image";
+      return `<span style="display:none" data-lb-group="${group}" data-lb-src="${src}" data-lb-type="${type}"></span>`;
+    })
+    .join("");
 
   return `<div class="mediaGrid">${tiles}</div>${hiddenAll}`;
 }
@@ -1609,7 +1632,8 @@ proxy.get("/posts/:id/media/:idx", async (req, res) => {
 
   const id = Number(req.params.id);
   const idx = Number(req.params.idx);
-  if (!Number.isFinite(id) || !Number.isFinite(idx)) return res.status(404).type("text").send("Not found");
+  if (!Number.isFinite(id) || !Number.isFinite(idx))
+    return res.status(404).type("text").send("Not found");
 
   try {
     const m = await getPostMediaRow(id, idx);
@@ -1624,10 +1648,26 @@ proxy.get("/posts/:id/media/:idx", async (req, res) => {
   }
 });
 
-/** Backward compatible single media route */
+/** Backward compatible single media route (FIXED: no proxy.handle recursion) */
 proxy.get("/posts/:id/media", async (req, res) => {
-  req.params.idx = "0";
-  return proxy.handle(req, res);
+  const customerId = getViewerCustomerId(req);
+  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
+
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(404).type("text").send("Not found");
+
+  try {
+    const m = await getPostMediaRow(id, 0);
+    if (!m?.media_bytes || !m?.media_mime) return res.status(404).type("text").send("Not found");
+
+    res.setHeader("Content-Type", m.media_mime);
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(m.media_bytes);
+  } catch (e) {
+    console.error("post media legacy error:", e);
+    return res.status(200).type("text").send("Media error");
+  }
 });
 
 /** Feed page (tabs) */
@@ -1642,9 +1682,7 @@ proxy.get("/", async (req, res) => {
       .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -1667,7 +1705,13 @@ proxy.get("/", async (req, res) => {
       : `<div class="postList" id="feedList">
           ${posts
             .map((p) =>
-              renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}?tab=${tab}` })
+              renderPostCard({
+                post: p,
+                base,
+                viewerId,
+                showAuthorLink: true,
+                returnPath: `${base}?tab=${tab}`,
+              })
             )
             .join("")}
         </div>`;
@@ -1786,7 +1830,13 @@ proxy.get("/feed/more", async (req, res) => {
 
   const html = posts
     .map((p) =>
-      renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}?tab=${tab}` })
+      renderPostCard({
+        post: p,
+        base,
+        viewerId,
+        showAuthorLink: true,
+        returnPath: `${base}?tab=${tab}`,
+      })
     )
     .join("");
 
@@ -1807,9 +1857,7 @@ proxy.post("/posts/:id/like", async (req, res) => {
 
   const returnPath = cleanText(req.body?.return, 300);
   const fallback =
-    req.headers.referer && String(req.headers.referer).includes("/proxy")
-      ? req.headers.referer
-      : `${base}`;
+    req.headers.referer && String(req.headers.referer).includes("/proxy") ? req.headers.referer : `${base}`;
 
   try {
     await toggleLike({ shop, postId: id, customerId: viewerId });
@@ -1836,9 +1884,7 @@ proxy.post("/posts/:id/comment", async (req, res) => {
   const body = cleanMultiline(req.body?.comment, 300);
   const returnPath = cleanText(req.body?.return, 300);
   const fallback =
-    req.headers.referer && String(req.headers.referer).includes("/proxy")
-      ? req.headers.referer
-      : `${base}`;
+    req.headers.referer && String(req.headers.referer).includes("/proxy") ? req.headers.referer : `${base}`;
 
   if (!body) return res.redirect(fallback + `#post-${id}`);
 
@@ -1864,16 +1910,13 @@ proxy.get("/me", async (req, res) => {
       .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
 
   const profile = await getProfile(viewerId);
-  const displayName =
-    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
 
   const handle = safeHandle(profile?.username);
   const handleLine = handle
@@ -1883,7 +1926,6 @@ proxy.get("/me", async (req, res) => {
   const avatarSrc = `${base}/me/avatar`;
   const editHref = `${base}/me/edit`;
 
-  // Posts created from profile go to FEED bucket
   const newPostHref = `${base}/post/new?return=me&bucket=feed`;
 
   const collectionHref = `${base}/collection`;
@@ -1970,16 +2012,13 @@ proxy.get("/u/:customerId", async (req, res) => {
       .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(
-      page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req)
-    );
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   const profile = await getProfile(targetId);
   if (!profile) return res.type("html").send(page(`<p class="error">User not found.</p>`, req));
 
-  const displayName =
-    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
   const handle = safeHandle(profile?.username);
   const handleLine = handle
     ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
@@ -2017,9 +2056,7 @@ proxy.get("/u/:customerId", async (req, res) => {
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
-              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(
-                avatarSvg
-              )}" alt="Profile photo" />
+              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(avatarSvg)}" alt="Profile photo" />
             </div>
 
             <div class="nameUnder">${escapeHtml(displayName)}</div>
@@ -2046,9 +2083,7 @@ proxy.get("/collection", async (req, res) => {
       .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -2067,7 +2102,13 @@ proxy.get("/collection", async (req, res) => {
       : `<div class="bucketGrid" id="bucketList">
           ${posts
             .map((p) =>
-              renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}/collection` })
+              renderPostCard({
+                post: p,
+                base,
+                viewerId,
+                showAuthorLink: true,
+                returnPath: `${base}/collection`,
+              })
             )
             .join("")}
         </div>`;
@@ -2148,9 +2189,7 @@ proxy.get("/trades", async (req, res) => {
       .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -2169,7 +2208,13 @@ proxy.get("/trades", async (req, res) => {
       : `<div class="bucketGrid" id="bucketList">
           ${posts
             .map((p) =>
-              renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}/trades` })
+              renderPostCard({
+                post: p,
+                base,
+                viewerId,
+                showAuthorLink: true,
+                returnPath: `${base}/trades`,
+              })
             )
             .join("")}
         </div>`;
@@ -2258,11 +2303,10 @@ proxy.get("/bucket/more", async (req, res) => {
     cursor,
   });
 
-  const returnPath = bucket === "collection" ? `${base}/collection` : bucket === "trades" ? `${base}/trades` : `${base}`;
+  const returnPath =
+    bucket === "collection" ? `${base}/collection` : bucket === "trades" ? `${base}/trades` : `${base}`;
   const html = posts
-    .map((p) =>
-      renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath })
-    )
+    .map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath }))
     .join("");
 
   return res.status(200).json({ html, nextCursor: nextCursor || "" });
@@ -2279,9 +2323,7 @@ proxy.get("/post/new", async (req, res) => {
       .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(
-      page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req)
-    );
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   const r = typeof req.query.return === "string" ? req.query.return : "feed";
@@ -2381,7 +2423,6 @@ proxy.post("/post/new", uploadPostMedia.array("media", MAX_MEDIA_FILES), async (
   if (requireMedia && !hasMedia) {
     const ret = cleanText(req.body?.return, 300);
     const back = ret && ret.startsWith("/") ? ret : `${base}`;
-    // collection/trades inline composer posts here, so redirect back with a flag
     return res.redirect(back + (back.includes("?") ? "&" : "?") + "media=1");
   }
 
@@ -2420,9 +2461,7 @@ proxy.get("/me/edit", async (req, res) => {
       .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -2465,14 +2504,10 @@ proxy.get("/me/edit", async (req, res) => {
               <input id="last_name" name="last_name" value="${escapeHtml(last)}" required />
 
               <label for="social_url">Social link</label>
-              <input id="social_url" name="social_url" value="${escapeHtml(
-                social_url
-              )}" placeholder="https://instagram.com/yourname" />
+              <input id="social_url" name="social_url" value="${escapeHtml(social_url)}" placeholder="https://instagram.com/yourname" />
 
               <label for="bio">Bio</label>
-              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(
-                bio
-              )}</textarea>
+              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(bio)}</textarea>
 
               <div class="row">
                 <button class="btn" type="submit">Save</button>
