@@ -1,16 +1,31 @@
 // server.js (FULL FILE REPLACEMENT)
-// Social Feed MVP + Updates:
-// - Hearts for likes (visible on mobile)
-// - Fullscreen media viewer (tap any image/video preview)
-// - Multi-media posts (upload multiple photos/videos per post) across all pages
-// - Collection page start (/proxy/collection):
-//   - Composer like /me, but requires at least 1 media file
-//   - Media timeline grid (2 columns on desktop and mobile)
-//   - Tap media to open fullscreen
-//
-// Notes:
-// - Adds post_media_v1 table for multi-media.
-// - Auto-migrates legacy single media (posts_v1.media_bytes) into post_media_v1 (idx=0) when missing.
+// Social Feed MVP + Buckets + Multi-media + Collection/Trades pages
+// - Feed page (/proxy/) shows composer + timeline
+// - Posts support optional caption (500 max) + optional media (photos/videos)
+// - Posts can include multiple media files
+// - Like + comment on posts
+// - Feed supports endless scroll via /feed/more?cursor=...
+// - Uses signed-cookie session so links stay clean
+// - Removes "Shop: ..." from all pages
+// UPDATE:
+// - Like button uses hearts (♡ / ♥) and is visible on mobile
+// - Buckets (tabs): feed, collection, trades
+//   - Posts made from feed or profile => bucket=feed
+//   - Posts made from collection page => bucket=collection
+//   - Posts made from trades page => bucket=trades
+// - Collection page:
+//   - Only shows posts bucket=collection
+//   - Has a composer that REQUIRES at least 1 media file
+//   - Timeline begins under the composer
+//   - Two-column grid on desktop AND mobile
+//   - Clicking media opens full screen viewer
+// - Trades page: same bucket behavior as collection (required media), basic start
+// - Comment rows show larger profile picture next to commenter name
+// - Post header shows profile picture next to the post author name (same sizing as comments)
+// - Comment text starts aligned under the commenter's name (not near the profile pic)
+// - Feed top shows Gold Nugget logo (half-size)
+// - Prevent HTML caching (no 304s for proxy pages)
+// - Server logs do not include querystring
 
 import express from "express";
 import crypto from "crypto";
@@ -48,7 +63,10 @@ const pool = DATABASE_URL
 const GOLD_NUGGET_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0681/6589/4299/files/LOGO_w_TEXT_-_Gold_Nugget_467d90fd-4797-4d4f-9ddc-f86b47c98edf.png?v=1748970231";
 
-// Uploaders
+/* ---------------------------
+   Uploaders (multi-media)
+---------------------------- */
+
 const uploadAvatar = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
@@ -56,9 +74,23 @@ const uploadAvatar = multer({
 
 const uploadPostMedia = multer({
   storage: multer.memoryStorage(),
-  // Limit is per-file for multer; keep conservative.
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB per file
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB PER FILE
 });
+
+const MAX_MEDIA_FILES = 8;
+
+function normalizeBucket(x) {
+  const v = String(x || "").toLowerCase().trim();
+  if (v === "collection" || v === "collections") return "collection";
+  if (v === "trade" || v === "trades") return "trades";
+  return "feed";
+}
+
+function bucketLabel(bucket) {
+  if (bucket === "collection") return "Collections";
+  if (bucket === "trades") return "Trades";
+  return "Feed";
+}
 
 async function ensureSchema() {
   if (!pool) return;
@@ -76,17 +108,29 @@ async function ensureSchema() {
     );
   `);
 
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`
+  );
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
+  );
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
+  await pool.query(
+    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
+  );
 
   // Backfill NULLs
   await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`);
+  await pool.query(
+    `UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`
+  );
   await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
@@ -112,7 +156,7 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET NOT NULL`);
 
-  // Posts (legacy single media columns kept for migration compatibility)
+  // Posts (legacy single media columns kept for backward compatibility)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS posts_v1 (
       id BIGSERIAL PRIMARY KEY,
@@ -121,48 +165,44 @@ async function ensureSchema() {
       body TEXT NOT NULL DEFAULT '',
       media_bytes BYTEA,
       media_mime TEXT NOT NULL DEFAULT '',
+      bucket TEXT NOT NULL DEFAULT 'feed',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  // Ensure new bucket column exists if older table already created
+  await pool.query(`ALTER TABLE posts_v1 ADD COLUMN IF NOT EXISTS bucket TEXT NOT NULL DEFAULT 'feed'`);
 
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET DEFAULT ''`);
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET DEFAULT ''`);
   await pool.query(`UPDATE posts_v1 SET body = '' WHERE body IS NULL`);
   await pool.query(`UPDATE posts_v1 SET media_mime = '' WHERE media_mime IS NULL`);
+  await pool.query(`UPDATE posts_v1 SET bucket = 'feed' WHERE bucket IS NULL OR bucket = ''`);
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET NOT NULL`);
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET NOT NULL`);
+  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN bucket SET NOT NULL`);
 
   await pool.query(
-    `CREATE INDEX IF NOT EXISTS posts_v1_shop_created_idx ON posts_v1 (shop, created_at DESC, id DESC)`
+    `CREATE INDEX IF NOT EXISTS posts_v1_shop_bucket_created_idx ON posts_v1 (shop, bucket, created_at DESC, id DESC)`
   );
   await pool.query(
-    `CREATE INDEX IF NOT EXISTS posts_v1_customer_created_idx ON posts_v1 (customer_id, created_at DESC, id DESC)`
+    `CREATE INDEX IF NOT EXISTS posts_v1_customer_bucket_created_idx ON posts_v1 (customer_id, bucket, created_at DESC, id DESC)`
   );
 
-  // Multi-media for posts
+  // Multi-media per post
   await pool.query(`
     CREATE TABLE IF NOT EXISTS post_media_v1 (
-      id BIGSERIAL PRIMARY KEY,
-      post_id BIGINT NOT NULL REFERENCES posts_v1(id) ON DELETE CASCADE,
+      post_id BIGINT NOT NULL,
       idx INT NOT NULL,
       media_bytes BYTEA NOT NULL,
-      media_mime TEXT NOT NULL DEFAULT ''
+      media_mime TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (post_id, idx)
     );
   `);
-  await pool.query(`ALTER TABLE post_media_v1 ALTER COLUMN media_mime SET DEFAULT ''`);
-  await pool.query(`UPDATE post_media_v1 SET media_mime = '' WHERE media_mime IS NULL`);
-  await pool.query(`ALTER TABLE post_media_v1 ALTER COLUMN media_mime SET NOT NULL`);
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS post_media_v1_post_idx_unique ON post_media_v1 (post_id, idx)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS post_media_v1_post_idx ON post_media_v1 (post_id)`);
-
-  // Migrate legacy single-media into post_media_v1 if missing
-  await pool.query(`
-    INSERT INTO post_media_v1 (post_id, idx, media_bytes, media_mime)
-    SELECT p.id, 0, p.media_bytes, p.media_mime
-    FROM posts_v1 p
-    WHERE p.media_bytes IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM post_media_v1 pm WHERE pm.post_id = p.id);
-  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS post_media_v1_post_idx ON post_media_v1 (post_id)`
+  );
 
   // Likes
   await pool.query(`
@@ -191,7 +231,9 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET DEFAULT ''`);
   await pool.query(`UPDATE comments_v1 SET body = '' WHERE body IS NULL`);
   await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET NOT NULL`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS comments_v1_post_created_idx ON comments_v1 (post_id, created_at ASC)`);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS comments_v1_post_created_idx ON comments_v1 (post_id, created_at ASC)`
+  );
 }
 
 /* ---------------------------
@@ -331,7 +373,8 @@ function basePathFromReq(req) {
 }
 
 function getViewerCustomerId(req) {
-  const q = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const q =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   if (q) return q;
 
   const cookies = parseCookies(req);
@@ -385,7 +428,7 @@ function safeHandle(username) {
   return u.startsWith("@") ? u : `@${u}`;
 }
 
-function isAllowedMediaMime(m) {
+function allowedMediaMime(m) {
   const allowed = new Set([
     "image/png",
     "image/jpeg",
@@ -395,7 +438,11 @@ function isAllowedMediaMime(m) {
     "video/webm",
     "video/quicktime",
   ]);
-  return allowed.has(String(m || ""));
+  return allowed.has(String(m || "").toLowerCase());
+}
+
+function isVideoMime(m) {
+  return String(m || "").toLowerCase().startsWith("video/");
 }
 
 /* ---------------------------
@@ -438,7 +485,7 @@ function page(bodyHtml, reqForBase) {
       body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.35}
       a{color:inherit}
       .nav a{margin-right:12px}
-      .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:860px}
+      .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:980px}
       code{background:#f5f5f5;padding:2px 6px;border-radius:6px}
       .muted{opacity:.75}
       .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;background:white;cursor:pointer}
@@ -458,7 +505,7 @@ function page(bodyHtml, reqForBase) {
       .nameUnder{margin-top:10px;font-weight:800}
       .handleUnder{margin-top:4px}
       .small{font-size:13px}
-      .stack{width:100%;max-width:720px}
+      .stack{width:100%;max-width:920px}
       .help{margin-top:6px}
 
       .brandBar{
@@ -478,16 +525,17 @@ function page(bodyHtml, reqForBase) {
 
       .composer{
         width:100%;
-        max-width:720px;
+        max-width:920px;
         border:1px solid #eee;
         border-radius:12px;
         padding:12px;
         margin-top:14px;
         background:#fff;
       }
-      .composerTop{display:flex;gap:10px;align-items:center}
+      .composerTop{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
       .composerFake{
         flex:1;
+        min-width:220px;
         border:1px solid #ddd;
         border-radius:10px;
         padding:10px 12px;
@@ -504,8 +552,24 @@ function page(bodyHtml, reqForBase) {
         justify-content:center;
         text-decoration:none;
         background:#fff;
-        font-size:18px;
-        line-height:1;
+      }
+
+      .tabsRow{
+        display:flex;
+        gap:10px;
+        flex-wrap:wrap;
+        margin-top:12px;
+      }
+      .tabBtn{
+        border:1px solid #ddd;
+        border-radius:999px;
+        padding:10px 14px;
+        text-decoration:none;
+        background:#fff;
+        font-weight:700;
+      }
+      .tabBtn.active{
+        border-color:#111;
       }
 
       .collectionsRow{
@@ -530,7 +594,7 @@ function page(bodyHtml, reqForBase) {
       .collectionTitle{font-weight:800}
       .chev{opacity:.65}
 
-      .postList{width:100%;max-width:720px;margin-top:14px}
+      .postList{width:100%;max-width:920px;margin-top:14px}
       .postItem{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:10px;background:#fff}
 
       .postHeader{
@@ -557,31 +621,40 @@ function page(bodyHtml, reqForBase) {
       .postAuthor{font-weight:800}
       .postMetaRight{display:flex;gap:10px;align-items:center}
 
-      .media{
+      .mediaGrid{
         width:100%;
-        max-width:100%;
-        border-radius:12px;
-        border:1px solid #eee;
+        display:grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap:8px;
         margin-top:10px;
-        background:#fafafa;
       }
-
-      .thumbRow{display:flex;gap:8px;flex-wrap:nowrap;overflow-x:auto;margin-top:10px;padding-bottom:2px}
-      .thumb{
-        width:64px;
-        height:64px;
+      .mediaTile{
+        width:100%;
         border-radius:12px;
         border:1px solid #eee;
-        object-fit:cover;
         background:#fafafa;
-        flex:0 0 auto;
+        overflow:hidden;
         cursor:pointer;
+        position:relative;
       }
-      .thumbMore{
-        width:64px;height:64px;border-radius:12px;border:1px solid #eee;
-        display:flex;align-items:center;justify-content:center;background:#fff;
-        flex:0 0 auto;
-        font-size:13px;
+      .mediaTile img, .mediaTile video{
+        display:block;
+        width:100%;
+        height:100%;
+        object-fit:cover;
+        aspect-ratio: 1 / 1;
+      }
+      .mediaTile video{object-fit:cover}
+      .mediaBadge{
+        position:absolute;
+        right:8px;
+        top:8px;
+        background:rgba(0,0,0,.65);
+        color:#fff;
+        border-radius:999px;
+        padding:4px 8px;
+        font-size:12px;
+        font-weight:700;
       }
 
       .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
@@ -591,19 +664,27 @@ function page(bodyHtml, reqForBase) {
         padding:10px 12px;
         background:#fff;
         cursor:pointer;
-        min-height:44px;
         display:inline-flex;
         align-items:center;
         gap:8px;
-        font-size:16px;
+        font-weight:800;
         line-height:1;
       }
       .actionBtn.liked{border-color:#111}
-      .heartGlyph{font-size:18px;line-height:1;display:inline-block}
-      .commentBox{margin-top:10px}
+      .heartIcon{
+        font-size:18px;
+        line-height:1;
+        display:inline-block;
+      }
 
+      .commentBox{margin-top:10px}
       .commentItem{border-top:1px solid #f0f0f0;padding-top:8px;margin-top:8px}
-      .commentRow{display:flex;gap:10px;align-items:flex-start}
+
+      .commentRow{
+        display:flex;
+        gap:10px;
+        align-items:flex-start;
+      }
       .commentAvatar{
         width:45px;
         height:45px;
@@ -614,101 +695,91 @@ function page(bodyHtml, reqForBase) {
         flex:0 0 auto;
         margin-top:1px;
       }
-      .commentBody{flex:1;min-width:0}
+      .commentBody{
+        flex:1;
+        min-width:0;
+      }
       .commentAuthor{font-weight:700; line-height:1.1}
       .commentText{white-space:pre-wrap; margin-top:4px}
 
       .divider{height:1px;background:#eee;margin:12px 0}
 
-      /* Collection grid: ALWAYS 2 columns (desktop and mobile) */
-      .mediaGrid2{
+      /* Two-column grid for Collection + Trades timelines on ALL sizes */
+      .bucketGrid{
         width:100%;
-        max-width:720px;
         margin-top:14px;
         display:grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap:10px;
       }
-      .mediaTile{
-        border:1px solid #eee;
-        border-radius:12px;
-        background:#fff;
-        overflow:hidden;
-        position:relative;
+      .bucketGrid .postItem{
+        margin-top:0;
       }
-      .tilePreview{
-        width:100%;
-        aspect-ratio:1/1;
-        object-fit:cover;
-        display:block;
-        background:#fafafa;
-        cursor:pointer;
-      }
-      .tileBadge{
-        position:absolute;
-        top:10px;
-        right:10px;
-        background:rgba(0,0,0,.75);
-        color:#fff;
-        padding:6px 8px;
-        border-radius:999px;
-        font-size:12px;
-        line-height:1;
-      }
-      .tileBar{
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        padding:10px;
-        gap:10px;
-      }
-      .tileMeta{font-size:13px;opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-      /* Fullscreen viewer */
-      .fsOverlay{
+      /* Lightbox */
+      .lb{
         position:fixed;
         inset:0;
-        background:rgba(0,0,0,.9);
+        background:rgba(0,0,0,.92);
         display:none;
         align-items:center;
         justify-content:center;
         z-index:9999;
         padding:18px;
       }
-      .fsInner{
+      .lb.show{display:flex}
+      .lbInner{
         width:100%;
+        height:100%;
         max-width:980px;
-        max-height:90vh;
+        max-height:980px;
         display:flex;
         flex-direction:column;
         gap:12px;
       }
-      .fsCloseRow{display:flex;justify-content:flex-end}
-      .fsClose{
-        border:1px solid rgba(255,255,255,.25);
-        background:rgba(0,0,0,.2);
+      .lbTop{
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
         color:#fff;
-        border-radius:10px;
+        gap:10px;
+      }
+      .lbBtn{
+        border:1px solid rgba(255,255,255,.35);
+        background:transparent;
+        color:#fff;
+        border-radius:12px;
         padding:10px 12px;
         cursor:pointer;
-        font-size:14px;
+        font-weight:800;
       }
-      .fsContent{
-        width:100%;
+      .lbStage{
+        flex:1;
         display:flex;
         align-items:center;
         justify-content:center;
+        overflow:hidden;
+        border-radius:14px;
       }
-      .fsContent img, .fsContent video{
+      .lbStage img, .lbStage video{
         max-width:100%;
-        max-height:80vh;
-        border-radius:12px;
-        background:#000;
+        max-height:100%;
+        width:auto;
+        height:auto;
+        border-radius:14px;
+        display:block;
+      }
+      .lbNav{
+        display:flex;
+        justify-content:center;
+        gap:10px;
       }
 
       @media (max-width: 520px){
-        .collectionsRow{grid-template-columns: 1fr}
         body{margin:16px}
+        .collectionsRow{grid-template-columns: 1fr}
+        .actionBtn{padding:10px 10px}
+        .heartIcon{font-size:20px}
       }
     </style>
   </head>
@@ -724,54 +795,115 @@ function page(bodyHtml, reqForBase) {
       ${bodyHtml}
     </div>
 
-    <div class="fsOverlay" id="fsOverlay" role="dialog" aria-modal="true">
-      <div class="fsInner">
-        <div class="fsCloseRow">
-          <button class="fsClose" type="button" id="fsCloseBtn">Close</button>
+    <div class="lb" id="lb">
+      <div class="lbInner">
+        <div class="lbTop">
+          <div id="lbTitle" class="small"></div>
+          <button class="lbBtn" type="button" id="lbClose">Close</button>
         </div>
-        <div class="fsContent" id="fsContent"></div>
+        <div class="lbStage" id="lbStage"></div>
+        <div class="lbNav">
+          <button class="lbBtn" type="button" id="lbPrev">Prev</button>
+          <button class="lbBtn" type="button" id="lbNext">Next</button>
+        </div>
       </div>
     </div>
 
     <script>
       (function(){
-        const overlay = document.getElementById('fsOverlay');
-        const content = document.getElementById('fsContent');
-        const closeBtn = document.getElementById('fsCloseBtn');
-        if (!overlay || !content || !closeBtn) return;
+        const lb = document.getElementById('lb');
+        const stage = document.getElementById('lbStage');
+        const title = document.getElementById('lbTitle');
+        const closeBtn = document.getElementById('lbClose');
+        const prevBtn = document.getElementById('lbPrev');
+        const nextBtn = document.getElementById('lbNext');
 
-        function close(){
-          overlay.style.display = 'none';
-          content.innerHTML = '';
-        }
+        let items = [];
+        let idx = 0;
 
-        function open(type, src){
-          overlay.style.display = 'flex';
-          if (type === 'video') {
-            content.innerHTML = '<video controls playsinline autoplay src="' + src + '"></video>';
+        function setStage(){
+          if (!stage) return;
+          stage.innerHTML = '';
+          const it = items[idx];
+          if (!it) return;
+
+          title.textContent = (idx + 1) + ' / ' + items.length;
+
+          if (it.type === 'video'){
+            const v = document.createElement('video');
+            v.src = it.src;
+            v.controls = true;
+            v.playsInline = true;
+            stage.appendChild(v);
           } else {
-            content.innerHTML = '<img src="' + src + '" alt="" />';
+            const im = document.createElement('img');
+            im.src = it.src;
+            im.alt = '';
+            stage.appendChild(im);
           }
         }
 
-        document.addEventListener('click', function(e){
+        function openLightbox(group, start){
+          const els = document.querySelectorAll('[data-lb-group="' + group + '"]');
+          const nextItems = [];
+          els.forEach((el) => {
+            const src = el.getAttribute('data-lb-src') || '';
+            const type = el.getAttribute('data-lb-type') || 'image';
+            if (src) nextItems.push({ src, type });
+          });
+          if (!nextItems.length) return;
+
+          items = nextItems;
+          idx = Math.max(0, Math.min(items.length - 1, Number(start) || 0));
+          setStage();
+
+          if (lb) lb.classList.add('show');
+          document.body.style.overflow = 'hidden';
+        }
+
+        function closeLightbox(){
+          if (lb) lb.classList.remove('show');
+          if (stage) stage.innerHTML = '';
+          document.body.style.overflow = '';
+          items = [];
+          idx = 0;
+        }
+
+        document.addEventListener('click', (e) => {
           const t = e.target;
-          const el = t && t.closest ? t.closest('[data-fs-src]') : null;
-          if (!el) return;
-          e.preventDefault();
-          const src = el.getAttribute('data-fs-src') || '';
-          const type = el.getAttribute('data-fs-type') || 'image';
-          if (!src) return;
-          open(type, src);
+          if (!(t instanceof HTMLElement)) return;
+
+          // open from media tile or inner media
+          const tile = t.closest && t.closest('[data-lb-open="1"]');
+          if (tile){
+            const group = tile.getAttribute('data-lb-group') || '';
+            const start = tile.getAttribute('data-lb-idx') || '0';
+            if (group) openLightbox(group, start);
+          }
         });
 
-        closeBtn.addEventListener('click', close);
-        overlay.addEventListener('click', function(e){
-          if (e.target === overlay) close();
-        });
+        if (closeBtn) closeBtn.addEventListener('click', closeLightbox);
+        if (lb) lb.addEventListener('click', (e) => { if (e.target === lb) closeLightbox(); });
 
-        document.addEventListener('keydown', function(e){
-          if (e.key === 'Escape') close();
+        function prev(){
+          if (!items.length) return;
+          idx = (idx - 1 + items.length) % items.length;
+          setStage();
+        }
+        function next(){
+          if (!items.length) return;
+          idx = (idx + 1) % items.length;
+          setStage();
+        }
+
+        if (prevBtn) prevBtn.addEventListener('click', prev);
+        if (nextBtn) nextBtn.addEventListener('click', next);
+
+        document.addEventListener('keydown', (e) => {
+          if (!lb || !lb.classList.contains('show')) return;
+          if (e.key === 'Escape') closeLightbox();
+          if (e.key === 'ArrowLeft') prev();
+          if (e.key === 'ArrowRight') next();
         });
       })();
     </script>
@@ -785,13 +917,18 @@ function page(bodyHtml, reqForBase) {
 
 function requireProxyAuth(req, res, next) {
   if (!SHOPIFY_API_SECRET) {
-    return res.status(200).type("html").send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, req));
+    return res
+      .status(200)
+      .type("html")
+      .send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, req));
   }
 
   if (verifyShopifyProxy(req)) {
     const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-    const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-    const pathPrefix = typeof req.query.path_prefix === "string" ? req.query.path_prefix : "/apps/nuggetdepot";
+    const customerId =
+      typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+    const pathPrefix =
+      typeof req.query.path_prefix === "string" ? req.query.path_prefix : "/apps/nuggetdepot";
     if (shop && customerId && pathPrefix) {
       setAuthCookie(res, { shop, customer_id: customerId, path_prefix: pathPrefix });
     }
@@ -892,67 +1029,139 @@ async function updateProfile(customerId, patch) {
   }
   vals.push(customerId);
 
-  await pool.query(`UPDATE profiles_v2 SET ${sets.join(", ")}, updated_at=NOW() WHERE customer_id=$${i}`, vals);
+  await pool.query(
+    `UPDATE profiles_v2 SET ${sets.join(", ")}, updated_at=NOW() WHERE customer_id=$${i}`,
+    vals
+  );
 }
 
-async function createPost({ shop, customerId, body, mediaFiles }) {
+async function createPost({ shop, customerId, body, bucket }) {
   if (!pool) throw new Error("DB not configured");
   await ensureSchema();
 
+  const b = normalizeBucket(bucket);
+
   const r = await pool.query(
-    `INSERT INTO posts_v1 (shop, customer_id, body, media_bytes, media_mime)
-     VALUES ($1,$2,$3,$4,$5)
+    `INSERT INTO posts_v1 (shop, customer_id, body, bucket)
+     VALUES ($1,$2,$3,$4)
      RETURNING id`,
-    [shop, customerId, body || "", null, ""]
+    [shop, customerId, body || "", b]
   );
-  const postId = r.rows?.[0]?.id || null;
-  if (!postId) return null;
-
-  if (Array.isArray(mediaFiles) && mediaFiles.length > 0) {
-    for (let i = 0; i < mediaFiles.length; i++) {
-      const f = mediaFiles[i];
-      await pool.query(
-        `INSERT INTO post_media_v1 (post_id, idx, media_bytes, media_mime)
-         VALUES ($1,$2,$3,$4)`,
-        [postId, i, f.buffer, f.mimetype || ""]
-      );
-    }
-  }
-
-  return postId;
+  return r.rows?.[0]?.id || null;
 }
 
-async function getPostMediaByIndex(postId, idx) {
+async function addPostMedia(postId, mediaItems) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
+  if (!postId) return;
+
+  const items = Array.isArray(mediaItems) ? mediaItems : [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (!it?.bytes || !it?.mime) continue;
+    await pool.query(
+      `INSERT INTO post_media_v1 (post_id, idx, media_bytes, media_mime) VALUES ($1,$2,$3,$4)`,
+      [postId, i, it.bytes, it.mime]
+    );
+  }
+}
+
+async function getPostMediaRow(postId, idx) {
   if (!pool) return null;
   await ensureSchema();
 
-  const r = await pool.query(
-    `SELECT media_bytes, media_mime
-     FROM post_media_v1
-     WHERE post_id=$1 AND idx=$2`,
-    [postId, idx]
-  );
-  if (r.rows?.[0]) return r.rows[0];
+  const i = Number(idx);
+  if (!Number.isFinite(i) || i < 0) return null;
 
-  // Fallback legacy
-  const legacy = await pool.query(`SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`, [postId]);
-  return legacy.rows?.[0] || null;
+  // New multi-media table
+  const r = await pool.query(
+    `SELECT media_bytes, media_mime FROM post_media_v1 WHERE post_id=$1 AND idx=$2`,
+    [postId, i]
+  );
+  if (r.rows?.[0]?.media_bytes && r.rows?.[0]?.media_mime) return r.rows[0];
+
+  // Backward compat: legacy single media columns in posts_v1 (only idx 0)
+  if (i === 0) {
+    const legacy = await pool.query(
+      `SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`,
+      [postId]
+    );
+    if (legacy.rows?.[0]?.media_bytes && legacy.rows?.[0]?.media_mime) return legacy.rows[0];
+  }
+
+  return null;
+}
+
+async function getPostMediaMeta(postIds) {
+  const byPostId = {};
+  for (const id of postIds) {
+    byPostId[id] = { media_count: 0, media_types: [] };
+  }
+  if (!pool || postIds.length === 0) return { byPostId };
+  await ensureSchema();
+
+  // Count new media
+  const r = await pool.query(
+    `SELECT post_id, COUNT(*)::int AS cnt
+     FROM post_media_v1
+     WHERE post_id = ANY($1::bigint[])
+     GROUP BY post_id`,
+    [postIds]
+  );
+  for (const row of r.rows || []) {
+    if (byPostId[row.post_id]) byPostId[row.post_id].media_count = Number(row.cnt) || 0;
+  }
+
+  // Pull mime list (up to MAX_MEDIA_FILES) for rendering
+  const r2 = await pool.query(
+    `SELECT post_id, idx, media_mime
+     FROM post_media_v1
+     WHERE post_id = ANY($1::bigint[])
+     ORDER BY post_id, idx ASC`,
+    [postIds]
+  );
+  for (const row of r2.rows || []) {
+    if (!byPostId[row.post_id]) continue;
+    byPostId[row.post_id].media_types.push({
+      idx: Number(row.idx) || 0,
+      mime: row.media_mime || "",
+    });
+  }
+
+  // Backward compat for old posts: if no post_media rows, infer 1 media from posts_v1.media_mime
+  const legacy = await pool.query(
+    `SELECT id, media_mime
+     FROM posts_v1
+     WHERE id = ANY($1::bigint[])`,
+    [postIds]
+  );
+  for (const row of legacy.rows || []) {
+    const pid = Number(row.id);
+    if (!byPostId[pid]) continue;
+    if (byPostId[pid].media_count > 0) continue;
+    const mm = String(row.media_mime || "").trim();
+    if (mm) {
+      byPostId[pid].media_count = 1;
+      byPostId[pid].media_types = [{ idx: 0, mime: mm }];
+    }
+  }
+
+  return { byPostId };
 }
 
 async function listPostsForCustomerWithMeta({ targetCustomerId, viewerCustomerId, limit = 20 }) {
   if (!pool) return { posts: [], nextCursor: "" };
   await ensureSchema();
 
+  // Profile pages show ONLY feed bucket posts
   const r = await pool.query(
     `
     SELECT
-      p.id, p.shop, p.customer_id, p.body, p.created_at,
-      pr.first_name, pr.last_name, pr.username,
-      COALESCE((SELECT COUNT(*)::int FROM post_media_v1 pm WHERE pm.post_id = p.id), 0) AS media_count,
-      (SELECT pm.media_mime FROM post_media_v1 pm WHERE pm.post_id = p.id ORDER BY pm.idx ASC LIMIT 1) AS media_mime_first
+      p.id, p.shop, p.customer_id, p.body, p.bucket, p.created_at,
+      pr.first_name, pr.last_name, pr.username
     FROM posts_v1 p
     LEFT JOIN profiles_v2 pr ON pr.customer_id = p.customer_id
-    WHERE p.customer_id = $1
+    WHERE p.customer_id = $1 AND p.bucket = 'feed'
     ORDER BY p.created_at DESC, p.id DESC
     LIMIT $2
     `,
@@ -961,38 +1170,49 @@ async function listPostsForCustomerWithMeta({ targetCustomerId, viewerCustomerId
 
   const posts = r.rows || [];
   const postIds = posts.map((x) => Number(x.id)).filter((x) => Number.isFinite(x));
+
   const meta = await getPostsMeta(postIds, viewerCustomerId);
+  const mediaMeta = await getPostMediaMeta(postIds);
 
   const nextCursor =
-    posts.length === limit ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id) : "";
+    posts.length === limit
+      ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id)
+      : "";
 
-  return { posts: posts.map((p) => ({ ...p, ...meta.byPostId[p.id] })), nextCursor };
+  return {
+    posts: posts.map((p) => ({
+      ...p,
+      ...meta.byPostId[p.id],
+      ...mediaMeta.byPostId[p.id],
+    })),
+    nextCursor,
+  };
 }
 
-async function listFeedPostsWithMeta({ shop, viewerCustomerId, limit = 20, cursor = null }) {
+async function listBucketPostsWithMeta({ shop, viewerCustomerId, bucket = "feed", limit = 20, cursor = null }) {
   if (!pool) return { posts: [], nextCursor: "" };
   await ensureSchema();
 
-  const params = [shop, limit];
+  const b = normalizeBucket(bucket);
+
+  const params = [shop, b, limit];
   let cursorClause = "";
 
   if (cursor?.createdAt && cursor?.id) {
-    cursorClause = ` AND (p.created_at < $3 OR (p.created_at = $3 AND p.id < $4))`;
+    cursorClause = ` AND (p.created_at < $4 OR (p.created_at = $4 AND p.id < $5))`;
     params.push(cursor.createdAt, cursor.id);
   }
 
   const r = await pool.query(
     `
     SELECT
-      p.id, p.shop, p.customer_id, p.body, p.created_at,
-      pr.first_name, pr.last_name, pr.username,
-      COALESCE((SELECT COUNT(*)::int FROM post_media_v1 pm WHERE pm.post_id = p.id), 0) AS media_count,
-      (SELECT pm.media_mime FROM post_media_v1 pm WHERE pm.post_id = p.id ORDER BY pm.idx ASC LIMIT 1) AS media_mime_first
+      p.id, p.shop, p.customer_id, p.body, p.bucket, p.created_at,
+      pr.first_name, pr.last_name, pr.username
     FROM posts_v1 p
     LEFT JOIN profiles_v2 pr ON pr.customer_id = p.customer_id
-    WHERE p.shop = $1${cursorClause}
+    WHERE p.shop = $1 AND p.bucket = $2${cursorClause}
     ORDER BY p.created_at DESC, p.id DESC
-    LIMIT $2
+    LIMIT $3
     `,
     params
   );
@@ -1000,11 +1220,21 @@ async function listFeedPostsWithMeta({ shop, viewerCustomerId, limit = 20, curso
   const posts = r.rows || [];
   const postIds = posts.map((x) => Number(x.id)).filter((x) => Number.isFinite(x));
   const meta = await getPostsMeta(postIds, viewerCustomerId);
+  const mediaMeta = await getPostMediaMeta(postIds);
 
   const nextCursor =
-    posts.length === limit ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id) : "";
+    posts.length === limit
+      ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id)
+      : "";
 
-  return { posts: posts.map((p) => ({ ...p, ...meta.byPostId[p.id] })), nextCursor };
+  return {
+    posts: posts.map((p) => ({
+      ...p,
+      ...meta.byPostId[p.id],
+      ...mediaMeta.byPostId[p.id],
+    })),
+    nextCursor,
+  };
 }
 
 async function getPostsMeta(postIds, viewerCustomerId) {
@@ -1051,7 +1281,7 @@ async function getPostsMeta(postIds, viewerCustomerId) {
     if (byPostId[row.post_id]) byPostId[row.post_id].comment_count = Number(row.cnt) || 0;
   }
 
-  // Preview last 2 comments
+  // Preview last 2 comments (author + body)
   const cR = await pool.query(
     `
     SELECT * FROM (
@@ -1089,7 +1319,11 @@ async function toggleLike({ shop, postId, customerId }) {
   await ensureSchema();
 
   try {
-    await pool.query(`INSERT INTO likes_v1 (shop, post_id, customer_id) VALUES ($1,$2,$3)`, [shop, postId, customerId]);
+    await pool.query(`INSERT INTO likes_v1 (shop, post_id, customer_id) VALUES ($1,$2,$3)`, [
+      shop,
+      postId,
+      customerId,
+    ]);
     return { liked: true };
   } catch {
     await pool.query(`DELETE FROM likes_v1 WHERE post_id=$1 AND customer_id=$2`, [postId, customerId]);
@@ -1100,12 +1334,103 @@ async function toggleLike({ shop, postId, customerId }) {
 async function addComment({ shop, postId, customerId, body }) {
   if (!pool) throw new Error("DB not configured");
   await ensureSchema();
-  await pool.query(`INSERT INTO comments_v1 (shop, post_id, customer_id, body) VALUES ($1,$2,$3,$4)`, [
-    shop,
-    postId,
-    customerId,
-    body,
-  ]);
+  await pool.query(
+    `INSERT INTO comments_v1 (shop, post_id, customer_id, body) VALUES ($1,$2,$3,$4)`,
+    [shop, postId, customerId, body]
+  );
+}
+
+/* ---------------------------
+   Rendering helpers
+---------------------------- */
+
+function renderTabs({ base, active }) {
+  const a = normalizeBucket(active);
+  const feedHref = `${base}?tab=feed`;
+  const colHref = `${base}?tab=collection`;
+  const trdHref = `${base}?tab=trades`;
+
+  return `
+    <div class="tabsRow">
+      <a class="tabBtn ${a === "feed" ? "active" : ""}" href="${feedHref}">Feed</a>
+      <a class="tabBtn ${a === "collection" ? "active" : ""}" href="${colHref}">Collections</a>
+      <a class="tabBtn ${a === "trades" ? "active" : ""}" href="${trdHref}">Trades</a>
+    </div>
+  `;
+}
+
+function renderInlineBucketComposer({ base, bucket, returnTo, requireMedia }) {
+  const b = normalizeBucket(bucket);
+  const title = bucketLabel(b);
+
+  return `
+    <div class="composer">
+      <div style="font-weight:900">${escapeHtml(title)} Post</div>
+      <div class="muted small help">${requireMedia ? "Media is required on this page." : "Media optional."} Up to ${MAX_MEDIA_FILES} files.</div>
+
+      <form method="POST" enctype="multipart/form-data" action="${base}/post/new" style="margin-top:10px">
+        <input type="hidden" name="return" value="${escapeHtml(returnTo)}" />
+        <input type="hidden" name="bucket" value="${escapeHtml(b)}" />
+
+        <label for="b_${b}_body">Caption (optional)</label>
+        <textarea id="b_${b}_body" name="body" maxlength="500" placeholder="Write something (max 500 characters)" style="min-height:120px"></textarea>
+
+        <label for="b_${b}_media">Photo or video ${requireMedia ? "(required)" : "(optional)"}</label>
+        <input id="b_${b}_media" type="file" name="media" ${requireMedia ? "required" : ""} multiple accept="image/*,video/*" />
+
+        <div class="row">
+          <button class="btn" type="submit">Post</button>
+        </div>
+
+        <div class="muted small help">15MB max per file.</div>
+      </form>
+    </div>
+  `;
+}
+
+function renderPostMediaHtml({ base, post }) {
+  const id = Number(post.id);
+  const types = Array.isArray(post.media_types) ? post.media_types : [];
+  const count = Number(post.media_count || 0);
+
+  if (!count || !types.length) return "";
+
+  const group = `post-${id}`;
+  const tiles = types.slice(0, MAX_MEDIA_FILES).map((t) => {
+    const idx = Number(t.idx) || 0;
+    const mime = String(t.mime || "");
+    const src = `${base}/posts/${id}/media/${idx}`;
+    const isVid = isVideoMime(mime);
+    const badge = count > 1 ? `<div class="mediaBadge">${count}</div>` : "";
+
+    if (isVid) {
+      // Video tile still opens in lightbox, but show a poster-less preview (controls off in tile)
+      return `
+        <div class="mediaTile" data-lb-open="1" data-lb-group="${group}" data-lb-idx="${idx}" data-lb-src="${src}" data-lb-type="video">
+          ${badge}
+          <video muted playsinline preload="metadata" src="${src}"></video>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="mediaTile" data-lb-open="1" data-lb-group="${group}" data-lb-idx="${idx}" data-lb-src="${src}" data-lb-type="image">
+        ${badge}
+        <img src="${src}" alt="Post media" />
+      </div>
+    `;
+  }).join("");
+
+  // Also add hidden media nodes for lightbox to discover all items
+  const hiddenAll = types.slice(0, MAX_MEDIA_FILES).map((t) => {
+    const idx = Number(t.idx) || 0;
+    const mime = String(t.mime || "");
+    const src = `${base}/posts/${id}/media/${idx}`;
+    const type = isVideoMime(mime) ? "video" : "image";
+    return `<span style="display:none" data-lb-group="${group}" data-lb-src="${src}" data-lb-type="${type}"></span>`;
+  }).join("");
+
+  return `<div class="mediaGrid">${tiles}</div>${hiddenAll}`;
 }
 
 /* ---------------------------
@@ -1119,11 +1444,6 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
   const when = new Date(post.created_at).toLocaleString();
 
   const body = escapeHtml(post.body || "");
-  const mediaCount = Number(post.media_count || 0);
-  const firstMime = String(post.media_mime_first || "").trim();
-  const hasMedia = mediaCount > 0 && !!firstMime;
-  const isVideo = hasMedia && firstMime.startsWith("video/");
-  const mediaUrl0 = `${base}/posts/${id}/media?i=0`;
 
   const authorHref = `${base}/u/${encodeURIComponent(post.customer_id)}`;
   const authorAvatar = `${base}/avatar/${encodeURIComponent(post.customer_id || "")}`;
@@ -1133,27 +1453,6 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
     : `<div class="postAuthor">${escapeHtml(authorName)}</div>`;
 
   const handleHtml = handle ? `<div class="muted small">${escapeHtml(handle)}</div>` : "";
-
-  const mediaHtml = !hasMedia
-    ? ""
-    : isVideo
-      ? `<video class="media" controls playsinline data-fs-src="${escapeHtml(mediaUrl0)}" data-fs-type="video" src="${escapeHtml(mediaUrl0)}"></video>`
-      : `<img class="media" src="${escapeHtml(mediaUrl0)}" alt="Post media" data-fs-src="${escapeHtml(mediaUrl0)}" data-fs-type="image" />`;
-
-  // Thumbnails for multi-image posts (only if first is image)
-  let thumbsHtml = "";
-  if (hasMedia && !isVideo && mediaCount > 1) {
-    const maxThumbs = Math.min(4, mediaCount);
-    const thumbs = [];
-    for (let i = 0; i < maxThumbs; i++) {
-      const u = `${base}/posts/${id}/media?i=${i}`;
-      thumbs.push(`<img class="thumb" src="${escapeHtml(u)}" alt="" data-fs-src="${escapeHtml(u)}" data-fs-type="image" />`);
-    }
-    if (mediaCount > maxThumbs) {
-      thumbs.push(`<div class="thumbMore">+${mediaCount - maxThumbs}</div>`);
-    }
-    thumbsHtml = `<div class="thumbRow">${thumbs.join("")}</div>`;
-  }
 
   const likeCount = Number(post.like_count || 0);
   const commentCount = Number(post.comment_count || 0);
@@ -1186,7 +1485,7 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
           })
           .join("");
 
-  const heart = liked ? "♥" : "♡";
+  const mediaHtml = renderPostMediaHtml({ base, post });
 
   return `
     <div class="postItem" id="post-${id}">
@@ -1204,13 +1503,12 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
 
       ${body ? `<p style="margin:10px 0 0 0;white-space:pre-wrap">${body}</p>` : ""}
       ${mediaHtml}
-      ${thumbsHtml}
 
       <div class="actions">
         <form method="POST" action="${likeAction}" style="margin:0">
           ${returnInput}
           <button class="actionBtn ${liked ? "liked" : ""}" type="submit" aria-label="Like">
-            <span class="heartGlyph">${heart}</span>
+            <span class="heartIcon">${liked ? "♥" : "♡"}</span>
             <span>${likeCount}</span>
           </button>
         </form>
@@ -1225,48 +1523,6 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
           <input name="comment" maxlength="300" placeholder="Write a comment..." />
           <button class="btn" type="submit" style="margin-top:10px">Comment</button>
         </form>
-      </div>
-    </div>
-  `;
-}
-
-/* ---------------------------
-   Collection media tile renderer
----------------------------- */
-
-function renderCollectionTile({ post, base }) {
-  const id = Number(post.id);
-  const mediaCount = Number(post.media_count || 0);
-  const firstMime = String(post.media_mime_first || "").trim();
-  const hasMedia = mediaCount > 0 && !!firstMime;
-  if (!hasMedia) return "";
-
-  const isVideo = firstMime.startsWith("video/");
-  const src0 = `${base}/posts/${id}/media?i=0`;
-
-  const liked = !!post.viewer_liked;
-  const heart = liked ? "♥" : "♡";
-  const likeCount = Number(post.like_count || 0);
-  const commentCount = Number(post.comment_count || 0);
-
-  const badge = mediaCount > 1 ? `<div class="tileBadge">+${mediaCount - 1}</div>` : "";
-  const preview = isVideo
-    ? `<video class="tilePreview" muted playsinline controls data-fs-src="${escapeHtml(src0)}" data-fs-type="video" src="${escapeHtml(src0)}"></video>`
-    : `<img class="tilePreview" src="${escapeHtml(src0)}" alt="" data-fs-src="${escapeHtml(src0)}" data-fs-type="image" />`;
-
-  return `
-    <div class="mediaTile">
-      ${badge}
-      ${preview}
-      <div class="tileBar">
-        <form method="POST" action="${base}/posts/${id}/like" style="margin:0">
-          <input type="hidden" name="return" value="${escapeHtml(base + "/collection")}" />
-          <button class="actionBtn ${liked ? "liked" : ""}" type="submit" aria-label="Like">
-            <span class="heartGlyph">${heart}</span>
-            <span>${likeCount}</span>
-          </button>
-        </form>
-        <div class="tileMeta">💬 ${commentCount}</div>
       </div>
     </div>
   `;
@@ -1317,7 +1573,7 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
-/** Avatar for any user (requires login) */
+/** Avatar for any user (used in comments + post headers, requires login) */
 proxy.get("/avatar/:customerId", async (req, res) => {
   const viewerId = getViewerCustomerId(req);
   if (!viewerId) return res.status(200).type("text").send("Not logged in");
@@ -1345,20 +1601,18 @@ proxy.get("/avatar/:customerId", async (req, res) => {
   }
 });
 
-/** Post media: supports multiple items via ?i=0..n (defaults to 0) */
-proxy.get("/posts/:id/media", async (req, res) => {
+/** Post media (multi) */
+proxy.get("/posts/:id/media/:idx", async (req, res) => {
   const customerId = getViewerCustomerId(req);
   if (!customerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(404).type("text").send("Not found");
-
-  const idxRaw = typeof req.query.i === "string" ? req.query.i : "0";
-  const idx = Math.max(0, Math.min(50, Number(idxRaw) || 0));
+  const idx = Number(req.params.idx);
+  if (!Number.isFinite(id) || !Number.isFinite(idx)) return res.status(404).type("text").send("Not found");
 
   try {
-    const m = await getPostMediaByIndex(id, idx);
+    const m = await getPostMediaRow(id, idx);
     if (!m?.media_bytes || !m?.media_mime) return res.status(404).type("text").send("Not found");
 
     res.setHeader("Content-Type", m.media_mime);
@@ -1370,26 +1624,39 @@ proxy.get("/posts/:id/media", async (req, res) => {
   }
 });
 
-/** Feed page */
+/** Backward compatible single media route */
+proxy.get("/posts/:id/media", async (req, res) => {
+  req.params.idx = "0";
+  return proxy.handle(req, res);
+});
+
+/** Feed page (tabs) */
 proxy.get("/", async (req, res) => {
   const shop = getShop(req);
   const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   if (!viewerId) {
-    return res.type("html").send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res
+      .type("html")
+      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
 
-  const newPostHref = `${base}/post/new?return=feed`;
+  const tab = normalizeBucket(typeof req.query.tab === "string" ? req.query.tab : "feed");
 
-  const { posts, nextCursor } = await listFeedPostsWithMeta({
+  const newPostHref = `${base}/post/new?return=feed&bucket=feed`;
+
+  const { posts, nextCursor } = await listBucketPostsWithMeta({
     shop,
     viewerCustomerId: viewerId,
+    bucket: tab,
     limit: 15,
     cursor: null,
   });
@@ -1398,12 +1665,16 @@ proxy.get("/", async (req, res) => {
     posts.length === 0
       ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
       : `<div class="postList" id="feedList">
-          ${posts.map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}` })).join("")}
+          ${posts
+            .map((p) =>
+              renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}?tab=${tab}` })
+            )
+            .join("")}
         </div>`;
 
   const moreBlock = `
     <div class="divider"></div>
-    <div id="feedMore" data-next="${escapeHtml(nextCursor || "")}">
+    <div id="feedMore" data-next="${escapeHtml(nextCursor || "")}" data-tab="${escapeHtml(tab)}">
       <div class="muted small" id="feedStatus">${nextCursor ? "Loading more as you scroll..." : "End of feed."}</div>
       <div id="feedSentinel" style="height:1px"></div>
     </div>
@@ -1419,11 +1690,12 @@ proxy.get("/", async (req, res) => {
 
         async function loadMore(){
           const next = more.getAttribute('data-next') || '';
+          const tab = more.getAttribute('data-tab') || 'feed';
           if (!next || loading) return;
           loading = true;
           status.textContent = 'Loading...';
           try{
-            const resp = await fetch('${base}/feed/more?cursor=' + encodeURIComponent(next), { credentials: 'same-origin' });
+            const resp = await fetch('${base}/feed/more?tab=' + encodeURIComponent(tab) + '&cursor=' + encodeURIComponent(next), { credentials: 'same-origin' });
             const data = await resp.json();
             if (data && data.html) {
               const tmp = document.createElement('div');
@@ -1450,6 +1722,29 @@ proxy.get("/", async (req, res) => {
     </script>
   `;
 
+  const composerHtml =
+    tab === "feed"
+      ? `
+        <div class="composer">
+          <div class="composerTop">
+            <a class="composerFake" href="${newPostHref}">Share something...</a>
+            <a class="iconBtn" href="${newPostHref}" aria-label="Add photo or video">＋</a>
+          </div>
+          <div class="muted small help">500 characters max. Media optional. Up to ${MAX_MEDIA_FILES} files.</div>
+          ${renderTabs({ base, active: tab })}
+        </div>
+      `
+      : `
+        <div class="composer">
+          <div style="font-weight:900">${escapeHtml(bucketLabel(tab))}</div>
+          <div class="muted small help">Use the dedicated page to post in this bucket.</div>
+          ${renderTabs({ base, active: tab })}
+          <div class="row" style="margin-top:10px">
+            <a class="btn" href="${base}/${tab === "collection" ? "collection" : "trades"}">Go to ${escapeHtml(bucketLabel(tab))} page</a>
+          </div>
+        </div>
+      `;
+
   return res.type("html").send(
     page(
       `
@@ -1458,13 +1753,7 @@ proxy.get("/", async (req, res) => {
             <img class="brandLogo" src="${GOLD_NUGGET_LOGO_URL}" alt="Gold Nugget" />
           </div>
 
-          <div class="composer">
-            <div class="composerTop">
-              <a class="composerFake" href="${newPostHref}">Share something...</a>
-              <a class="iconBtn" href="${newPostHref}" aria-label="Add photo or video">＋</a>
-            </div>
-            <div class="muted small help">500 characters max. Media optional. Multi-upload supported.</div>
-          </div>
+          ${composerHtml}
 
           ${postsHtml}
           ${moreBlock}
@@ -1475,7 +1764,7 @@ proxy.get("/", async (req, res) => {
   );
 });
 
-/** Feed endless loader */
+/** Feed endless loader (bucket-aware) */
 proxy.get("/feed/more", async (req, res) => {
   const shop = getShop(req);
   const viewerId = getViewerCustomerId(req);
@@ -1484,15 +1773,23 @@ proxy.get("/feed/more", async (req, res) => {
   if (!viewerId) return res.status(200).json({ html: "", nextCursor: "" });
   if (!pool) return res.status(200).json({ html: "", nextCursor: "" });
 
+  const tab = normalizeBucket(typeof req.query.tab === "string" ? req.query.tab : "feed");
   const cursor = decodeCursor(typeof req.query.cursor === "string" ? req.query.cursor : "");
-  const { posts, nextCursor } = await listFeedPostsWithMeta({
+
+  const { posts, nextCursor } = await listBucketPostsWithMeta({
     shop,
     viewerCustomerId: viewerId,
+    bucket: tab,
     limit: 15,
     cursor,
   });
 
-  const html = posts.map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}` })).join("");
+  const html = posts
+    .map((p) =>
+      renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}?tab=${tab}` })
+    )
+    .join("");
+
   return res.status(200).json({ html, nextCursor: nextCursor || "" });
 });
 
@@ -1509,7 +1806,10 @@ proxy.post("/posts/:id/like", async (req, res) => {
   if (!Number.isFinite(id)) return res.redirect(base);
 
   const returnPath = cleanText(req.body?.return, 300);
-  const fallback = req.headers.referer && String(req.headers.referer).includes("/proxy") ? req.headers.referer : `${base}`;
+  const fallback =
+    req.headers.referer && String(req.headers.referer).includes("/proxy")
+      ? req.headers.referer
+      : `${base}`;
 
   try {
     await toggleLike({ shop, postId: id, customerId: viewerId });
@@ -1535,7 +1835,10 @@ proxy.post("/posts/:id/comment", async (req, res) => {
 
   const body = cleanMultiline(req.body?.comment, 300);
   const returnPath = cleanText(req.body?.return, 300);
-  const fallback = req.headers.referer && String(req.headers.referer).includes("/proxy") ? req.headers.referer : `${base}`;
+  const fallback =
+    req.headers.referer && String(req.headers.referer).includes("/proxy")
+      ? req.headers.referer
+      : `${base}`;
 
   if (!body) return res.redirect(fallback + `#post-${id}`);
 
@@ -1556,23 +1859,32 @@ proxy.get("/me", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!viewerId) {
-    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res
+      .type("html")
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
 
   const profile = await getProfile(viewerId);
-  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const displayName =
+    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
 
   const handle = safeHandle(profile?.username);
-  const handleLine = handle ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>` : `<div class="muted handleUnder">Username not set</div>`;
+  const handleLine = handle
+    ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
+    : `<div class="muted handleUnder">Username not set</div>`;
 
   const avatarSrc = `${base}/me/avatar`;
   const editHref = `${base}/me/edit`;
-  const newPostHref = `${base}/post/new?return=me`;
+
+  // Posts created from profile go to FEED bucket
+  const newPostHref = `${base}/post/new?return=me&bucket=feed`;
 
   const collectionHref = `${base}/collection`;
   const tradesHref = `${base}/trades`;
@@ -1587,7 +1899,11 @@ proxy.get("/me", async (req, res) => {
     posts.length === 0
       ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
       : `<div class="postList">
-          ${posts.map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: false, returnPath: `${base}/me` })).join("")}
+          ${posts
+            .map((p) =>
+              renderPostCard({ post: p, base, viewerId, showAuthorLink: false, returnPath: `${base}/me` })
+            )
+            .join("")}
         </div>`;
 
   return res.type("html").send(
@@ -1608,14 +1924,14 @@ proxy.get("/me", async (req, res) => {
                 <a class="composerFake" href="${newPostHref}">Share something...</a>
                 <a class="iconBtn" href="${newPostHref}" aria-label="Add photo or video">＋</a>
               </div>
-              <div class="muted small help">500 characters max. Media optional. Multi-upload supported.</div>
+              <div class="muted small help">500 characters max. Media optional. Up to ${MAX_MEDIA_FILES} files.</div>
             </div>
 
             <div class="collectionsRow">
               <a class="collectionCard" href="${collectionHref}" aria-label="Go to Collection">
                 <div>
                   <div class="collectionTitle">Collection</div>
-                  <div class="muted small">View your saved cards</div>
+                  <div class="muted small">Collection bucket posts</div>
                 </div>
                 <div class="chev">›</div>
               </a>
@@ -1623,7 +1939,7 @@ proxy.get("/me", async (req, res) => {
               <a class="collectionCard" href="${tradesHref}" aria-label="Go to Trades">
                 <div>
                   <div class="collectionTitle">Trades</div>
-                  <div class="muted small">Offers and listings</div>
+                  <div class="muted small">Trades bucket posts</div>
                 </div>
                 <div class="chev">›</div>
               </a>
@@ -1638,59 +1954,7 @@ proxy.get("/me", async (req, res) => {
   );
 });
 
-/** Collection page (start) */
-proxy.get("/collection", async (req, res) => {
-  const shop = getShop(req);
-  const viewerId = getViewerCustomerId(req);
-  const base = basePathFromReq(req);
-
-  if (!viewerId) {
-    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
-  }
-  if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
-  }
-
-  await ensureRow(viewerId, shop);
-
-  // Composer requires media on this page
-  const newPostHref = `${base}/post/new?return=collection&require_media=1`;
-
-  const { posts } = await listPostsForCustomerWithMeta({
-    targetCustomerId: viewerId,
-    viewerCustomerId: viewerId,
-    limit: 50,
-  });
-
-  // Only show tiles that have media
-  const tiles = posts.map((p) => renderCollectionTile({ post: p, base })).filter(Boolean);
-
-  const gridHtml =
-    tiles.length === 0
-      ? `<div class="postList"><p class="muted">No media posts yet.</p></div>`
-      : `<div class="mediaGrid2">${tiles.join("")}</div>`;
-
-  return res.type("html").send(
-    page(
-      `
-        <div class="stack">
-          <div class="composer">
-            <div class="composerTop">
-              <a class="composerFake" href="${newPostHref}">Add to your collection...</a>
-              <a class="iconBtn" href="${newPostHref}" aria-label="Add media">＋</a>
-            </div>
-            <div class="muted small help">Media required on this page. Multi-upload supported.</div>
-          </div>
-
-          ${gridHtml}
-        </div>
-      `,
-      req
-    )
-  );
-});
-
-/** Public profile: /u/:customerId (no composer) */
+/** Public profile: /u/:customerId (feed-only posts, no composer) */
 proxy.get("/u/:customerId", async (req, res) => {
   const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
@@ -1701,18 +1965,25 @@ proxy.get("/u/:customerId", async (req, res) => {
   if (viewerId && targetId === viewerId) return res.redirect(`${base}/me`);
 
   if (!viewerId) {
-    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res
+      .type("html")
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(
+      page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req)
+    );
   }
 
   const profile = await getProfile(targetId);
   if (!profile) return res.type("html").send(page(`<p class="error">User not found.</p>`, req));
 
-  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const displayName =
+    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
   const handle = safeHandle(profile?.username);
-  const handleLine = handle ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>` : `<div class="muted handleUnder">Username not set</div>`;
+  const handleLine = handle
+    ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
+    : `<div class="muted handleUnder">Username not set</div>`;
 
   const ini = initialsFor(profile?.first_name || "", profile?.last_name || "");
   const avatarSvg = svgAvatar(ini);
@@ -1746,7 +2017,9 @@ proxy.get("/u/:customerId", async (req, res) => {
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
-              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(avatarSvg)}" alt="Profile photo" />
+              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+                avatarSvg
+              )}" alt="Profile photo" />
             </div>
 
             <div class="nameUnder">${escapeHtml(displayName)}</div>
@@ -1761,32 +2034,271 @@ proxy.get("/u/:customerId", async (req, res) => {
   );
 });
 
-/** New post page (supports multi-upload) */
+/** Collection page (bucket=collection only, required media, two-column grid) */
+proxy.get("/collection", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) {
+    return res
+      .type("html")
+      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+  }
+  if (!pool) {
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+  }
+
+  await ensureRow(viewerId, shop);
+
+  const { posts, nextCursor } = await listBucketPostsWithMeta({
+    shop,
+    viewerCustomerId: viewerId,
+    bucket: "collection",
+    limit: 24,
+    cursor: null,
+  });
+
+  const gridHtml =
+    posts.length === 0
+      ? `<p class="muted">No collection posts yet.</p>`
+      : `<div class="bucketGrid" id="bucketList">
+          ${posts
+            .map((p) =>
+              renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}/collection` })
+            )
+            .join("")}
+        </div>`;
+
+  const moreBlock = `
+    <div class="divider"></div>
+    <div id="bucketMore" data-next="${escapeHtml(nextCursor || "")}">
+      <div class="muted small" id="bucketStatus">${nextCursor ? "Loading more as you scroll..." : "End of posts."}</div>
+      <div id="bucketSentinel" style="height:1px"></div>
+    </div>
+    <script>
+      (function(){
+        const more = document.getElementById('bucketMore');
+        const sentinel = document.getElementById('bucketSentinel');
+        const list = document.getElementById('bucketList');
+        const status = document.getElementById('bucketStatus');
+        if (!more || !sentinel || !list || !status) return;
+
+        let loading = false;
+
+        async function loadMore(){
+          const next = more.getAttribute('data-next') || '';
+          if (!next || loading) return;
+          loading = true;
+          status.textContent = 'Loading...';
+          try{
+            const resp = await fetch('${base}/bucket/more?bucket=collection&cursor=' + encodeURIComponent(next), { credentials: 'same-origin' });
+            const data = await resp.json();
+            if (data && data.html) {
+              const tmp = document.createElement('div');
+              tmp.innerHTML = data.html;
+              while(tmp.firstChild) list.appendChild(tmp.firstChild);
+            }
+            more.setAttribute('data-next', (data && data.nextCursor) ? data.nextCursor : '');
+            status.textContent = (data && data.nextCursor) ? 'Loading more as you scroll...' : 'End of posts.';
+          }catch(e){
+            status.textContent = 'Could not load more.';
+          }finally{
+            loading = false;
+          }
+        }
+
+        const io = new IntersectionObserver((entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) loadMore();
+          });
+        }, { root: null, rootMargin: '600px', threshold: 0 });
+
+        io.observe(sentinel);
+      })();
+    </script>
+  `;
+
+  return res.type("html").send(
+    page(
+      `
+        <div class="stack">
+          <div style="font-weight:900;font-size:18px">My Collection</div>
+          ${renderInlineBucketComposer({ base, bucket: "collection", returnTo: `${base}/collection`, requireMedia: true })}
+          ${gridHtml}
+          ${moreBlock}
+        </div>
+      `,
+      req
+    )
+  );
+});
+
+/** Trades page (bucket=trades only, required media, two-column grid) */
+proxy.get("/trades", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) {
+    return res
+      .type("html")
+      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+  }
+  if (!pool) {
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+  }
+
+  await ensureRow(viewerId, shop);
+
+  const { posts, nextCursor } = await listBucketPostsWithMeta({
+    shop,
+    viewerCustomerId: viewerId,
+    bucket: "trades",
+    limit: 24,
+    cursor: null,
+  });
+
+  const gridHtml =
+    posts.length === 0
+      ? `<p class="muted">No trade posts yet.</p>`
+      : `<div class="bucketGrid" id="bucketList">
+          ${posts
+            .map((p) =>
+              renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}/trades` })
+            )
+            .join("")}
+        </div>`;
+
+  const moreBlock = `
+    <div class="divider"></div>
+    <div id="bucketMore" data-next="${escapeHtml(nextCursor || "")}">
+      <div class="muted small" id="bucketStatus">${nextCursor ? "Loading more as you scroll..." : "End of posts."}</div>
+      <div id="bucketSentinel" style="height:1px"></div>
+    </div>
+    <script>
+      (function(){
+        const more = document.getElementById('bucketMore');
+        const sentinel = document.getElementById('bucketSentinel');
+        const list = document.getElementById('bucketList');
+        const status = document.getElementById('bucketStatus');
+        if (!more || !sentinel || !list || !status) return;
+
+        let loading = false;
+
+        async function loadMore(){
+          const next = more.getAttribute('data-next') || '';
+          if (!next || loading) return;
+          loading = true;
+          status.textContent = 'Loading...';
+          try{
+            const resp = await fetch('${base}/bucket/more?bucket=trades&cursor=' + encodeURIComponent(next), { credentials: 'same-origin' });
+            const data = await resp.json();
+            if (data && data.html) {
+              const tmp = document.createElement('div');
+              tmp.innerHTML = data.html;
+              while(tmp.firstChild) list.appendChild(tmp.firstChild);
+            }
+            more.setAttribute('data-next', (data && data.nextCursor) ? data.nextCursor : '');
+            status.textContent = (data && data.nextCursor) ? 'Loading more as you scroll...' : 'End of posts.';
+          }catch(e){
+            status.textContent = 'Could not load more.';
+          }finally{
+            loading = false;
+          }
+        }
+
+        const io = new IntersectionObserver((entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) loadMore();
+          });
+        }, { root: null, rootMargin: '600px', threshold: 0 });
+
+        io.observe(sentinel);
+      })();
+    </script>
+  `;
+
+  return res.type("html").send(
+    page(
+      `
+        <div class="stack">
+          <div style="font-weight:900;font-size:18px">Trades</div>
+          ${renderInlineBucketComposer({ base, bucket: "trades", returnTo: `${base}/trades`, requireMedia: true })}
+          ${gridHtml}
+          ${moreBlock}
+        </div>
+      `,
+      req
+    )
+  );
+});
+
+/** Bucket endless loader (collection/trades) */
+proxy.get("/bucket/more", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) return res.status(200).json({ html: "", nextCursor: "" });
+  if (!pool) return res.status(200).json({ html: "", nextCursor: "" });
+
+  const bucket = normalizeBucket(typeof req.query.bucket === "string" ? req.query.bucket : "feed");
+  const cursor = decodeCursor(typeof req.query.cursor === "string" ? req.query.cursor : "");
+
+  const { posts, nextCursor } = await listBucketPostsWithMeta({
+    shop,
+    viewerCustomerId: viewerId,
+    bucket,
+    limit: 24,
+    cursor,
+  });
+
+  const returnPath = bucket === "collection" ? `${base}/collection` : bucket === "trades" ? `${base}/trades` : `${base}`;
+  const html = posts
+    .map((p) =>
+      renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath })
+    )
+    .join("");
+
+  return res.status(200).json({ html, nextCursor: nextCursor || "" });
+});
+
+/** New post page (feed bucket only via this UI; supports multi-media) */
 proxy.get("/post/new", async (req, res) => {
   const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   if (!viewerId) {
-    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res
+      .type("html")
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(
+      page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req)
+    );
   }
 
   const r = typeof req.query.return === "string" ? req.query.return : "feed";
   const returnTo =
-    r === "me" ? `${base}/me` : r === "feed" ? `${base}` : r === "collection" ? `${base}/collection` : r.startsWith("/") ? r : `${base}`;
+    r === "me" ? `${base}/me` : r === "feed" ? `${base}?tab=feed` : r.startsWith("/") ? r : `${base}`;
 
-  const requireMedia = typeof req.query.require_media === "string" && req.query.require_media === "1";
+  const bucket = normalizeBucket(typeof req.query.bucket === "string" ? req.query.bucket : "feed");
+  const requireMedia = bucket !== "feed";
 
   const status =
     req.query.err === "1"
-      ? `<p class="error">${requireMedia ? "Add at least one media file." : "Add text or media."}</p>`
+      ? `<p class="error">Add text or media.</p>`
       : req.query.type === "1"
-        ? `<p class="error">Unsupported file type.</p>`
-        : req.query.size === "1"
-          ? `<p class="error">File too large.</p>`
-          : "";
+      ? `<p class="error">Unsupported file type.</p>`
+      : req.query.media === "1"
+      ? `<p class="error">Media is required for this post.</p>`
+      : "";
 
   const postAction = `${base}/post/new`;
   const cancelHref = returnTo;
@@ -1798,22 +2310,20 @@ proxy.get("/post/new", async (req, res) => {
         <div class="stack">
           <form method="POST" enctype="multipart/form-data" action="${postAction}">
             <input type="hidden" name="return" value="${escapeHtml(returnTo)}" />
-            <input type="hidden" name="require_media" value="${requireMedia ? "1" : "0"}" />
+            <input type="hidden" name="bucket" value="${escapeHtml(bucket)}" />
 
             <label for="body">Post</label>
             <textarea id="body" name="body" maxlength="500" placeholder="Write your post (max 500 characters)"></textarea>
             <div class="muted small help">0 to 500 characters.</div>
 
-            <label for="media">Photo or video</label>
-            <input id="media" type="file" name="media" accept="image/*,video/*" multiple />
+            <label for="media">Photo or video ${requireMedia ? "(required)" : "(optional)"}</label>
+            <input id="media" type="file" name="media" ${requireMedia ? "required" : ""} multiple accept="image/*,video/*" />
+            <div class="muted small help">Up to ${MAX_MEDIA_FILES} files. 15MB max per file.</div>
 
             <div class="row">
               <button class="btn" type="submit" id="sendBtn">Send</button>
               <a class="btn" href="${cancelHref}">Cancel</a>
             </div>
-
-            <div class="muted small help">Up to 6 files. Max 15MB each.</div>
-            ${requireMedia ? `<div class="muted small help"><b>Media required for Collection posts.</b></div>` : ""}
           </form>
         </div>
 
@@ -1842,8 +2352,8 @@ proxy.get("/post/new", async (req, res) => {
   );
 });
 
-/** Create post (multi-upload) */
-proxy.post("/post/new", uploadPostMedia.array("media", 6), async (req, res) => {
+/** Create post (multi-media, bucket-aware, required media for non-feed buckets) */
+proxy.post("/post/new", uploadPostMedia.array("media", MAX_MEDIA_FILES), async (req, res) => {
   const shop = getShop(req);
   const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
@@ -1851,26 +2361,32 @@ proxy.post("/post/new", uploadPostMedia.array("media", 6), async (req, res) => {
   if (!viewerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
+  const bucket = normalizeBucket(req.body?.bucket);
+  const requireMedia = bucket !== "feed";
+
   const body = cleanMultiline(req.body?.body, 500);
-  const requireMedia = String(req.body?.require_media || "0") === "1";
 
   const files = Array.isArray(req.files) ? req.files : [];
-  const mediaFiles = [];
+  const mediaItems = [];
 
   for (const f of files) {
     if (!f || !f.buffer || !f.mimetype) continue;
-    if (!isAllowedMediaMime(f.mimetype)) return res.redirect(`${base}/post/new?type=1&return=${encodeURIComponent(req.body?.return || "")}${requireMedia ? "&require_media=1" : ""}`);
-    mediaFiles.push({ buffer: f.buffer, mimetype: f.mimetype });
+    if (!allowedMediaMime(f.mimetype)) return res.redirect(`${base}/post/new?type=1`);
+    mediaItems.push({ bytes: f.buffer, mime: f.mimetype });
   }
 
   const hasText = !!(body && body.trim());
-  const hasMedia = mediaFiles.length > 0;
+  const hasMedia = mediaItems.length > 0;
 
   if (requireMedia && !hasMedia) {
-    return res.redirect(`${base}/post/new?err=1&return=${encodeURIComponent(req.body?.return || "")}&require_media=1`);
+    const ret = cleanText(req.body?.return, 300);
+    const back = ret && ret.startsWith("/") ? ret : `${base}`;
+    // collection/trades inline composer posts here, so redirect back with a flag
+    return res.redirect(back + (back.includes("?") ? "&" : "?") + "media=1");
   }
+
   if (!requireMedia && !hasText && !hasMedia) {
-    return res.redirect(`${base}/post/new?err=1&return=${encodeURIComponent(req.body?.return || "")}`);
+    return res.redirect(`${base}/post/new?err=1`);
   }
 
   const returnToRaw = cleanText(req.body?.return, 300);
@@ -1878,11 +2394,17 @@ proxy.post("/post/new", uploadPostMedia.array("media", 6), async (req, res) => {
 
   try {
     await ensureRow(viewerId, shop);
-    await createPost({ shop, customerId: viewerId, body, mediaFiles });
+    const postId = await createPost({ shop, customerId: viewerId, body, bucket });
+    if (!postId) return res.redirect(`${base}/post/new?err=1`);
+
+    if (hasMedia) {
+      await addPostMedia(postId, mediaItems);
+    }
+
     return res.redirect(returnTo);
   } catch (e) {
     console.error("create post error:", e);
-    return res.redirect(`${base}/post/new?err=1&return=${encodeURIComponent(req.body?.return || "")}${requireMedia ? "&require_media=1" : ""}`);
+    return res.redirect(`${base}/post/new?err=1`);
   }
 });
 
@@ -1893,10 +2415,14 @@ proxy.get("/me/edit", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!viewerId) {
-    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res
+      .type("html")
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -1939,10 +2465,14 @@ proxy.get("/me/edit", async (req, res) => {
               <input id="last_name" name="last_name" value="${escapeHtml(last)}" required />
 
               <label for="social_url">Social link</label>
-              <input id="social_url" name="social_url" value="${escapeHtml(social_url)}" placeholder="https://instagram.com/yourname" />
+              <input id="social_url" name="social_url" value="${escapeHtml(
+                social_url
+              )}" placeholder="https://instagram.com/yourname" />
 
               <label for="bio">Bio</label>
-              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(bio)}</textarea>
+              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(
+                bio
+              )}</textarea>
 
               <div class="row">
                 <button class="btn" type="submit">Save</button>
@@ -2019,8 +2549,6 @@ proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
     return res.redirect(`${base}/me/edit`);
   }
 });
-
-proxy.get("/trades", (req, res) => res.type("html").send(page(`<p>Trades placeholder.</p>`, req)));
 
 app.use("/proxy", proxy);
 
