@@ -1,17 +1,12 @@
 // server.js (FULL FILE REPLACEMENT)
-// Fixes navigation without carrying Shopify signed querystring by using a signed cookie session.
-//
-// What this does:
-// - First request from Shopify App Proxy is verified with signature
-// - On success, server sets an HMAC-signed cookie containing shop, customer_id, path_prefix
-// - Subsequent clicks use clean URLs without signature and still pass auth via cookie
-//
-// Keeps your current features:
-// - /me and /me/edit navigation
-// - Posting MVP (/post/new), 500 chars max, optional media, redirects back to /me
-// - Public profile /u/:customerId does NOT show composer
-// - Collection + Trades cards under composer on /me
-// - Removes shop footer from all pages
+// Adds Social Feed MVP:
+// - Feed page (/proxy/) shows composer + global timeline (latest first)
+// - Posts support optional caption (500 max) + optional media (photo/video)
+// - Like + comment on feed posts (also enabled anywhere posts are rendered)
+// - Feed supports endless scroll via /feed/more?cursor=...
+// - Posts created from anywhere can redirect back via /post/new?return=feed|me|<path>
+// - Uses signed-cookie session so links stay clean (no signed querystring in URLs)
+// - Removes "Shop: ..." from all pages
 
 import express from "express";
 import crypto from "crypto";
@@ -50,7 +45,7 @@ const uploadAvatar = multer({
 
 const uploadPostMedia = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB (MVP)
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
 });
 
 async function ensureSchema() {
@@ -126,8 +121,40 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET NOT NULL`);
 
   await pool.query(
-    `CREATE INDEX IF NOT EXISTS posts_v1_customer_created_idx ON posts_v1 (customer_id, created_at DESC)`
+    `CREATE INDEX IF NOT EXISTS posts_v1_shop_created_idx ON posts_v1 (shop, created_at DESC, id DESC)`
   );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS posts_v1_customer_created_idx ON posts_v1 (customer_id, created_at DESC, id DESC)`
+  );
+
+  // Likes
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS likes_v1 (
+      shop TEXT NOT NULL,
+      post_id BIGINT NOT NULL,
+      customer_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (post_id, customer_id)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS likes_v1_post_idx ON likes_v1 (post_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS likes_v1_customer_idx ON likes_v1 (customer_id)`);
+
+  // Comments
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS comments_v1 (
+      id BIGSERIAL PRIMARY KEY,
+      shop TEXT NOT NULL,
+      post_id BIGINT NOT NULL,
+      customer_id TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET DEFAULT ''`);
+  await pool.query(`UPDATE comments_v1 SET body = '' WHERE body IS NULL`);
+  await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS comments_v1_post_created_idx ON comments_v1 (post_id, created_at ASC)`);
 }
 
 /* ---------------------------
@@ -182,8 +209,9 @@ function parseCookies(req) {
   return out;
 }
 
-function b64urlEncode(buf) {
-  return Buffer.from(buf)
+function b64urlEncode(input) {
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input), "utf8");
+  return buf
     .toString("base64")
     .replace(/=/g, "")
     .replace(/\+/g, "-")
@@ -221,14 +249,11 @@ function verifySession(token) {
     const obj = JSON.parse(json);
     if (!obj || typeof obj !== "object") return null;
 
-    // Minimal required fields
     if (typeof obj.customer_id !== "string" || !obj.customer_id) return null;
     if (typeof obj.shop !== "string" || !obj.shop) return null;
     if (typeof obj.path_prefix !== "string" || !obj.path_prefix) return null;
 
-    // Optional expiry
     if (obj.exp && Date.now() > Number(obj.exp)) return null;
-
     return obj;
   } catch {
     return null;
@@ -236,7 +261,6 @@ function verifySession(token) {
 }
 
 function setAuthCookie(res, payload) {
-  // 7 days
   const exp = Date.now() + 7 * 24 * 60 * 60 * 1000;
 
   const token = signSession({
@@ -246,15 +270,12 @@ function setAuthCookie(res, payload) {
     exp,
   });
 
-  // Set cookie for proxy path only
   const parts = [];
   parts.push(`${AUTH_COOKIE}=${encodeURIComponent(token)}`);
   parts.push("Path=/proxy");
   parts.push("HttpOnly");
   parts.push("SameSite=Lax");
-  // Render is https behind proxy, setting Secure is correct
   parts.push("Secure");
-  // 7 days
   parts.push(`Max-Age=${7 * 24 * 60 * 60}`);
 
   res.setHeader("Set-Cookie", parts.join("; "));
@@ -265,11 +286,9 @@ function setAuthCookie(res, payload) {
 ---------------------------- */
 
 function basePathFromReq(req) {
-  // Prefer query path_prefix when present and signed
   const p = typeof req.query.path_prefix === "string" ? req.query.path_prefix : "";
   if (p && p.startsWith("/")) return p;
 
-  // Fallback to cookie
   const cookies = parseCookies(req);
   const session = verifySession(cookies[AUTH_COOKIE]);
   const sp = session?.path_prefix || "";
@@ -295,6 +314,70 @@ function getShop(req) {
   const session = verifySession(cookies[AUTH_COOKIE]);
   return session?.shop || "";
 }
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function cleanText(input, max = 80) {
+  return String(input || "").trim().slice(0, max);
+}
+function cleanMultiline(input, max = 400) {
+  return String(input || "").replace(/\r\n/g, "\n").trim().slice(0, max);
+}
+function initialsFor(first, last) {
+  const a = (first || "").trim().slice(0, 1).toUpperCase();
+  const b = (last || "").trim().slice(0, 1).toUpperCase();
+  const x = `${a}${b}`.trim();
+  return x || "GN";
+}
+function svgAvatar(initials) {
+  const safe = String(initials || "GN").replace(/[^A-Z0-9]/g, "").slice(0, 2) || "GN";
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">
+  <rect width="240" height="240" rx="32" fill="#f2f2f2"/>
+  <text x="50%" y="54%" text-anchor="middle" dominant-baseline="middle"
+        font-family="system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif"
+        font-size="84" fill="#111">${safe}</text>
+</svg>`;
+}
+function safeHandle(username) {
+  const u = String(username || "").trim();
+  if (!u) return "";
+  return u.startsWith("@") ? u : `@${u}`;
+}
+
+/* ---------------------------
+   Pagination cursor
+---------------------------- */
+
+function encodeCursor(createdAt, id) {
+  if (!createdAt || !id) return "";
+  return b64urlEncode(`${new Date(createdAt).toISOString()}|${id}`);
+}
+
+function decodeCursor(cursor) {
+  if (!cursor) return null;
+  try {
+    const raw = b64urlDecodeToString(String(cursor));
+    const [iso, idStr] = raw.split("|");
+    const t = new Date(iso);
+    const id = Number(idStr);
+    if (!Number.isFinite(id) || isNaN(t.getTime())) return null;
+    return { createdAt: t.toISOString(), id };
+  } catch {
+    return null;
+  }
+}
+
+/* ---------------------------
+   Page renderer
+---------------------------- */
 
 function page(bodyHtml, reqForBase) {
   const base = basePathFromReq(reqForBase);
@@ -385,8 +468,10 @@ function page(bodyHtml, reqForBase) {
       .chev{opacity:.65}
 
       .postList{width:100%;max-width:720px;margin-top:14px}
-      .postItem{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:10px}
-      .postMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+      .postItem{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:10px;background:#fff}
+      .postHeader{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:flex-start}
+      .postAuthor{font-weight:800}
+      .postMetaRight{display:flex;gap:10px;align-items:center}
       .media{
         width:100%;
         max-width:100%;
@@ -395,6 +480,19 @@ function page(bodyHtml, reqForBase) {
         margin-top:10px;
         background:#fafafa;
       }
+      .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+      .actionBtn{
+        border:1px solid #ddd;
+        border-radius:10px;
+        padding:8px 10px;
+        background:#fff;
+        cursor:pointer;
+      }
+      .actionBtn.liked{border-color:#111}
+      .commentBox{margin-top:10px}
+      .commentItem{border-top:1px solid #f0f0f0;padding-top:8px;margin-top:8px}
+      .commentAuthor{font-weight:700}
+      .divider{height:1px;background:#eee;margin:12px 0}
 
       @media (max-width: 520px){
         .collectionsRow{grid-template-columns: 1fr}
@@ -416,43 +514,6 @@ function page(bodyHtml, reqForBase) {
 </html>`;
 }
 
-function escapeHtml(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function cleanText(input, max = 80) {
-  return String(input || "").trim().slice(0, max);
-}
-function cleanMultiline(input, max = 400) {
-  return String(input || "").replace(/\r\n/g, "\n").trim().slice(0, max);
-}
-function initialsFor(first, last) {
-  const a = (first || "").trim().slice(0, 1).toUpperCase();
-  const b = (last || "").trim().slice(0, 1).toUpperCase();
-  const x = `${a}${b}`.trim();
-  return x || "GN";
-}
-function svgAvatar(initials) {
-  const safe = String(initials || "GN").replace(/[^A-Z0-9]/g, "").slice(0, 2) || "GN";
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">
-  <rect width="240" height="240" rx="32" fill="#f2f2f2"/>
-  <text x="50%" y="54%" text-anchor="middle" dominant-baseline="middle"
-        font-family="system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif"
-        font-size="84" fill="#111">${safe}</text>
-</svg>`;
-}
-function safeHandle(username) {
-  const u = String(username || "").trim();
-  if (!u) return "";
-  return u.startsWith("@") ? u : `@${u}`;
-}
-
 /* ---------------------------
    Auth middleware
 ---------------------------- */
@@ -462,21 +523,17 @@ function requireProxyAuth(req, res, next) {
     return res.status(200).type("html").send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, req));
   }
 
-  // If Shopify signed request is present and valid, accept and set cookie.
   if (verifyShopifyProxy(req)) {
     const shop = typeof req.query.shop === "string" ? req.query.shop : "";
     const customerId =
       typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
     const pathPrefix = typeof req.query.path_prefix === "string" ? req.query.path_prefix : "/apps/nuggetdepot";
-
     if (shop && customerId && pathPrefix) {
       setAuthCookie(res, { shop, customer_id: customerId, path_prefix: pathPrefix });
     }
-
     return next();
   }
 
-  // Otherwise fallback to cookie session.
   const cookies = parseCookies(req);
   const session = verifySession(cookies[AUTH_COOKIE]);
   if (session) return next();
@@ -486,8 +543,8 @@ function requireProxyAuth(req, res, next) {
     page(
       `
         <p class="error">Invalid proxy signature.</p>
-        <p class="muted">Path: <code>${req.originalUrl}</code></p>
-        <p class="muted">Query keys: <code>${keys || "none"}</code></p>
+        <p class="muted">Path: <code>${escapeHtml(req.originalUrl)}</code></p>
+        <p class="muted">Query keys: <code>${escapeHtml(keys || "none")}</code></p>
       `,
       req
     )
@@ -572,25 +629,269 @@ async function createPost({ shop, customerId, body, mediaBytes, mediaMime }) {
   return r.rows?.[0]?.id || null;
 }
 
-async function listPostsForCustomer(customerId, limit = 20) {
-  if (!pool) return [];
-  await ensureSchema();
-  const r = await pool.query(
-    `SELECT id, body, media_mime, created_at
-     FROM posts_v1
-     WHERE customer_id=$1
-     ORDER BY created_at DESC
-     LIMIT $2`,
-    [customerId, limit]
-  );
-  return r.rows || [];
-}
-
 async function getPostMedia(postId) {
   if (!pool) return null;
   await ensureSchema();
   const r = await pool.query(`SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`, [postId]);
   return r.rows?.[0] || null;
+}
+
+async function listPostsForCustomerWithMeta({ targetCustomerId, viewerCustomerId, limit = 20 }) {
+  if (!pool) return { posts: [], nextCursor: "" };
+  await ensureSchema();
+
+  const r = await pool.query(
+    `
+    SELECT
+      p.id, p.shop, p.customer_id, p.body, p.media_mime, p.created_at,
+      pr.first_name, pr.last_name, pr.username
+    FROM posts_v1 p
+    LEFT JOIN profiles_v2 pr ON pr.customer_id = p.customer_id
+    WHERE p.customer_id = $1
+    ORDER BY p.created_at DESC, p.id DESC
+    LIMIT $2
+    `,
+    [targetCustomerId, limit]
+  );
+
+  const posts = r.rows || [];
+  const postIds = posts.map((x) => Number(x.id)).filter((x) => Number.isFinite(x));
+
+  const meta = await getPostsMeta(postIds, viewerCustomerId);
+
+  const nextCursor =
+    posts.length === limit ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id) : "";
+
+  return { posts: posts.map((p) => ({ ...p, ...meta.byPostId[p.id] })), nextCursor };
+}
+
+async function listFeedPostsWithMeta({ shop, viewerCustomerId, limit = 20, cursor = null }) {
+  if (!pool) return { posts: [], nextCursor: "" };
+  await ensureSchema();
+
+  let where = `p.shop = $1`;
+  const params = [shop, limit];
+  let cursorClause = "";
+
+  if (cursor?.createdAt && cursor?.id) {
+    // (created_at, id) < (cursorCreatedAt, cursorId)
+    cursorClause = ` AND (p.created_at < $3 OR (p.created_at = $3 AND p.id < $4))`;
+    params.push(cursor.createdAt, cursor.id);
+  }
+
+  const r = await pool.query(
+    `
+    SELECT
+      p.id, p.shop, p.customer_id, p.body, p.media_mime, p.created_at,
+      pr.first_name, pr.last_name, pr.username
+    FROM posts_v1 p
+    LEFT JOIN profiles_v2 pr ON pr.customer_id = p.customer_id
+    WHERE ${where}${cursorClause}
+    ORDER BY p.created_at DESC, p.id DESC
+    LIMIT $2
+    `,
+    params
+  );
+
+  const posts = r.rows || [];
+  const postIds = posts.map((x) => Number(x.id)).filter((x) => Number.isFinite(x));
+  const meta = await getPostsMeta(postIds, viewerCustomerId);
+
+  const nextCursor =
+    posts.length === limit ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id) : "";
+
+  return { posts: posts.map((p) => ({ ...p, ...meta.byPostId[p.id] })), nextCursor };
+}
+
+async function getPostsMeta(postIds, viewerCustomerId) {
+  const byPostId = {};
+  for (const id of postIds) {
+    byPostId[id] = { like_count: 0, comment_count: 0, viewer_liked: false, comments_preview: [] };
+  }
+  if (!pool || postIds.length === 0) return { byPostId };
+
+  // Likes count
+  const likesR = await pool.query(
+    `SELECT post_id, COUNT(*)::int AS cnt
+     FROM likes_v1
+     WHERE post_id = ANY($1::bigint[])
+     GROUP BY post_id`,
+    [postIds]
+  );
+  for (const row of likesR.rows || []) {
+    if (byPostId[row.post_id]) byPostId[row.post_id].like_count = Number(row.cnt) || 0;
+  }
+
+  // Viewer liked
+  if (viewerCustomerId) {
+    const viewerR = await pool.query(
+      `SELECT post_id
+       FROM likes_v1
+       WHERE post_id = ANY($1::bigint[]) AND customer_id = $2`,
+      [postIds, viewerCustomerId]
+    );
+    for (const row of viewerR.rows || []) {
+      if (byPostId[row.post_id]) byPostId[row.post_id].viewer_liked = true;
+    }
+  }
+
+  // Comment counts
+  const cCountR = await pool.query(
+    `SELECT post_id, COUNT(*)::int AS cnt
+     FROM comments_v1
+     WHERE post_id = ANY($1::bigint[])
+     GROUP BY post_id`,
+    [postIds]
+  );
+  for (const row of cCountR.rows || []) {
+    if (byPostId[row.post_id]) byPostId[row.post_id].comment_count = Number(row.cnt) || 0;
+  }
+
+  // Preview last 2 comments (author + body)
+  const cR = await pool.query(
+    `
+    SELECT * FROM (
+      SELECT
+        c.post_id, c.body, c.created_at, c.customer_id,
+        pr.first_name, pr.last_name, pr.username,
+        ROW_NUMBER() OVER (PARTITION BY c.post_id ORDER BY c.created_at DESC, c.id DESC) AS rn
+      FROM comments_v1 c
+      LEFT JOIN profiles_v2 pr ON pr.customer_id = c.customer_id
+      WHERE c.post_id = ANY($1::bigint[])
+    ) t
+    WHERE t.rn <= 2
+    ORDER BY t.post_id, t.created_at ASC
+    `,
+    [postIds]
+  );
+
+  for (const row of cR.rows || []) {
+    if (!byPostId[row.post_id]) continue;
+    byPostId[row.post_id].comments_preview.push({
+      body: row.body || "",
+      created_at: row.created_at,
+      first_name: row.first_name || "",
+      last_name: row.last_name || "",
+      username: row.username || "",
+      customer_id: row.customer_id || "",
+    });
+  }
+
+  return { byPostId };
+}
+
+async function toggleLike({ shop, postId, customerId }) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
+
+  // Try insert; if conflict, delete (toggle)
+  try {
+    await pool.query(
+      `INSERT INTO likes_v1 (shop, post_id, customer_id) VALUES ($1,$2,$3)`,
+      [shop, postId, customerId]
+    );
+    return { liked: true };
+  } catch (e) {
+    // conflict on PK -> unlike
+    await pool.query(`DELETE FROM likes_v1 WHERE post_id=$1 AND customer_id=$2`, [postId, customerId]);
+    return { liked: false };
+  }
+}
+
+async function addComment({ shop, postId, customerId, body }) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
+  await pool.query(
+    `INSERT INTO comments_v1 (shop, post_id, customer_id, body) VALUES ($1,$2,$3,$4)`,
+    [shop, postId, customerId, body]
+  );
+}
+
+/* ---------------------------
+   Post card renderer
+---------------------------- */
+
+function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPath }) {
+  const id = Number(post.id);
+  const authorName = `${post.first_name || ""} ${post.last_name || ""}`.trim() || "User";
+  const handle = safeHandle(post.username || "");
+  const when = new Date(post.created_at).toLocaleString();
+
+  const body = escapeHtml(post.body || "");
+  const hasMedia = !!(post.media_mime && String(post.media_mime).trim());
+  const isVideo = hasMedia && String(post.media_mime).startsWith("video/");
+  const mediaUrl = `${base}/posts/${id}/media`;
+
+  const authorHref = `${base}/u/${encodeURIComponent(post.customer_id)}`;
+  const authorHtml = showAuthorLink ? `<a href="${authorHref}" class="postAuthor">${escapeHtml(authorName)}</a>` : `<div class="postAuthor">${escapeHtml(authorName)}</div>`;
+  const handleHtml = handle ? `<div class="muted small">${escapeHtml(handle)}</div>` : "";
+
+  const mediaHtml = !hasMedia
+    ? ""
+    : isVideo
+      ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
+      : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
+
+  const likeCount = Number(post.like_count || 0);
+  const commentCount = Number(post.comment_count || 0);
+  const liked = !!post.viewer_liked;
+
+  const likeAction = `${base}/posts/${id}/like`;
+  const commentAction = `${base}/posts/${id}/comment`;
+
+  const returnInput = `<input type="hidden" name="return" value="${escapeHtml(returnPath || "")}" />`;
+
+  const commentsPreview = Array.isArray(post.comments_preview) ? post.comments_preview : [];
+  const previewHtml =
+    commentsPreview.length === 0
+      ? ""
+      : commentsPreview
+          .map((c) => {
+            const cn = `${c.first_name || ""} ${c.last_name || ""}`.trim() || "User";
+            return `
+              <div class="commentItem">
+                <div class="commentAuthor">${escapeHtml(cn)}</div>
+                <div class="small" style="white-space:pre-wrap">${escapeHtml(c.body || "")}</div>
+              </div>
+            `;
+          })
+          .join("");
+
+  return `
+    <div class="postItem" id="post-${id}">
+      <div class="postHeader">
+        <div>
+          ${authorHtml}
+          ${handleHtml}
+          <div class="muted small">${escapeHtml(when)}</div>
+        </div>
+        <div class="postMetaRight"></div>
+      </div>
+
+      ${body ? `<p style="margin:10px 0 0 0;white-space:pre-wrap">${body}</p>` : ""}
+      ${mediaHtml}
+
+      <div class="actions">
+        <form method="POST" action="${likeAction}" style="margin:0">
+          ${returnInput}
+          <button class="actionBtn ${liked ? "liked" : ""}" type="submit">
+            ${liked ? "Liked" : "Like"} (${likeCount})
+          </button>
+        </form>
+
+        <span class="muted small">Comments: ${commentCount}</span>
+      </div>
+
+      <div class="commentBox">
+        ${previewHtml}
+        <form method="POST" action="${commentAction}" style="margin-top:10px">
+          ${returnInput}
+          <input name="comment" maxlength="300" placeholder="Write a comment..." />
+          <button class="btn" type="submit" style="margin-top:10px">Comment</button>
+        </form>
+      </div>
+    </div>
+  `;
 }
 
 /* ---------------------------
@@ -616,14 +917,7 @@ app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
-proxy.get("/", async (req, res) => {
-  const customerId = getViewerCustomerId(req);
-  if (!customerId) {
-    return res.type("html").send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
-  }
-  return res.type("html").send(page(`<p>Feed placeholder.</p>`, req));
-});
-
+/** Avatar */
 proxy.get("/me/avatar", async (req, res) => {
   const customerId = getViewerCustomerId(req);
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -648,6 +942,7 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
+/** Post media */
 proxy.get("/posts/:id/media", async (req, res) => {
   const customerId = getViewerCustomerId(req);
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -669,21 +964,198 @@ proxy.get("/posts/:id/media", async (req, res) => {
   }
 });
 
-proxy.get("/me", async (req, res) => {
+/** Feed page (composer + global timeline) */
+proxy.get("/", async (req, res) => {
   const shop = getShop(req);
-  const customerId = getViewerCustomerId(req);
+  const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
-  if (!customerId) {
+  if (!viewerId) {
+    return res.type("html").send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+  }
+  if (!pool) {
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+  }
+
+  await ensureRow(viewerId, shop);
+
+  const newPostHref = `${base}/post/new?return=feed`;
+
+  const { posts, nextCursor } = await listFeedPostsWithMeta({
+    shop,
+    viewerCustomerId: viewerId,
+    limit: 15,
+    cursor: null,
+  });
+
+  const postsHtml =
+    posts.length === 0
+      ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
+      : `<div class="postList" id="feedList">
+          ${posts.map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}` })).join("")}
+        </div>`;
+
+  const moreBlock = `
+    <div class="divider"></div>
+    <div id="feedMore" data-next="${escapeHtml(nextCursor || "")}">
+      <div class="muted small" id="feedStatus">${nextCursor ? "Loading more as you scroll..." : "End of feed."}</div>
+      <div id="feedSentinel" style="height:1px"></div>
+    </div>
+    <script>
+      (function(){
+        const more = document.getElementById('feedMore');
+        const sentinel = document.getElementById('feedSentinel');
+        const list = document.getElementById('feedList');
+        const status = document.getElementById('feedStatus');
+        if (!more || !sentinel || !list || !status) return;
+
+        let loading = false;
+
+        async function loadMore(){
+          const next = more.getAttribute('data-next') || '';
+          if (!next || loading) return;
+          loading = true;
+          status.textContent = 'Loading...';
+          try{
+            const resp = await fetch('${base}/feed/more?cursor=' + encodeURIComponent(next), { credentials: 'same-origin' });
+            const data = await resp.json();
+            if (data && data.html) {
+              const tmp = document.createElement('div');
+              tmp.innerHTML = data.html;
+              while(tmp.firstChild) list.appendChild(tmp.firstChild);
+            }
+            more.setAttribute('data-next', (data && data.nextCursor) ? data.nextCursor : '');
+            status.textContent = (data && data.nextCursor) ? 'Loading more as you scroll...' : 'End of feed.';
+          }catch(e){
+            status.textContent = 'Could not load more.';
+          }finally{
+            loading = false;
+          }
+        }
+
+        const io = new IntersectionObserver((entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) loadMore();
+          });
+        }, { root: null, rootMargin: '600px', threshold: 0 });
+
+        io.observe(sentinel);
+      })();
+    </script>
+  `;
+
+  return res.type("html").send(
+    page(
+      `
+        <div class="stack">
+          <div class="composer">
+            <div class="composerTop">
+              <a class="composerFake" href="${newPostHref}">Share something...</a>
+              <a class="iconBtn" href="${newPostHref}" aria-label="Add photo or video">＋</a>
+            </div>
+            <div class="muted small help">500 characters max. Media optional.</div>
+          </div>
+
+          ${postsHtml}
+          ${moreBlock}
+        </div>
+      `,
+      req
+    )
+  );
+});
+
+/** Feed endless loader */
+proxy.get("/feed/more", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) return res.status(200).json({ html: "", nextCursor: "" });
+  if (!pool) return res.status(200).json({ html: "", nextCursor: "" });
+
+  const cursor = decodeCursor(typeof req.query.cursor === "string" ? req.query.cursor : "");
+  const { posts, nextCursor } = await listFeedPostsWithMeta({
+    shop,
+    viewerCustomerId: viewerId,
+    limit: 15,
+    cursor,
+  });
+
+  const html = posts.map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}` })).join("");
+
+  return res.status(200).json({ html, nextCursor: nextCursor || "" });
+});
+
+/** Like toggle */
+proxy.post("/posts/:id/like", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
+
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.redirect(base);
+
+  const returnPath = cleanText(req.body?.return, 300);
+  const fallback = req.headers.referer && String(req.headers.referer).includes("/proxy") ? req.headers.referer : `${base}`;
+
+  try {
+    await toggleLike({ shop, postId: id, customerId: viewerId });
+    if (returnPath && returnPath.startsWith("/")) return res.redirect(returnPath + `#post-${id}`);
+    return res.redirect(fallback + `#post-${id}`);
+  } catch (e) {
+    console.error("like error:", e);
+    return res.redirect(fallback + `#post-${id}`);
+  }
+});
+
+/** Add comment */
+proxy.post("/posts/:id/comment", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
+
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.redirect(base);
+
+  const body = cleanMultiline(req.body?.comment, 300);
+  const returnPath = cleanText(req.body?.return, 300);
+  const fallback = req.headers.referer && String(req.headers.referer).includes("/proxy") ? req.headers.referer : `${base}`;
+
+  if (!body) return res.redirect(fallback + `#post-${id}`);
+
+  try {
+    await addComment({ shop, postId: id, customerId: viewerId, body });
+    if (returnPath && returnPath.startsWith("/")) return res.redirect(returnPath + `#post-${id}`);
+    return res.redirect(fallback + `#post-${id}`);
+  } catch (e) {
+    console.error("comment error:", e);
+    return res.redirect(fallback + `#post-${id}`);
+  }
+});
+
+/** My Profile */
+proxy.get("/me", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) {
     return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
-  await ensureRow(customerId, shop);
+  await ensureRow(viewerId, shop);
 
-  const profile = await getProfile(customerId);
+  const profile = await getProfile(viewerId);
   const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
 
   const handle = safeHandle(profile?.username);
@@ -693,40 +1165,23 @@ proxy.get("/me", async (req, res) => {
 
   const avatarSrc = `${base}/me/avatar`;
   const editHref = `${base}/me/edit`;
-  const newPostHref = `${base}/post/new`;
+  const newPostHref = `${base}/post/new?return=me`;
 
   const collectionHref = `${base}/collection`;
   const tradesHref = `${base}/trades`;
 
-  const posts = await listPostsForCustomer(customerId, 20);
+  const { posts } = await listPostsForCustomerWithMeta({
+    targetCustomerId: viewerId,
+    viewerCustomerId: viewerId,
+    limit: 20,
+  });
 
   const postsHtml =
     posts.length === 0
       ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
       : `<div class="postList">
           ${posts
-            .map((p) => {
-              const body = escapeHtml(p.body || "");
-              const hasMedia = !!(p.media_mime && p.media_mime.trim());
-              const isVideo = hasMedia && p.media_mime.startsWith("video/");
-              const mediaUrl = `${base}/posts/${p.id}/media`;
-              const mediaHtml = !hasMedia
-                ? ""
-                : isVideo
-                  ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
-                  : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
-              const when = new Date(p.created_at).toLocaleString();
-
-              return `
-                <div class="postItem">
-                  <div class="postMeta">
-                    <span class="muted small">${escapeHtml(when)}</span>
-                  </div>
-                  ${body ? `<p style="margin:10px 0 0 0;white-space:pre-wrap">${body}</p>` : ""}
-                  ${mediaHtml}
-                </div>
-              `;
-            })
+            .map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: false, returnPath: `${base}/me` }))
             .join("")}
         </div>`;
 
@@ -778,6 +1233,7 @@ proxy.get("/me", async (req, res) => {
   );
 });
 
+/** Public profile: /u/:customerId (no composer) */
 proxy.get("/u/:customerId", async (req, res) => {
   const shop = getShop(req);
   const viewerId = getViewerCustomerId(req);
@@ -807,34 +1263,18 @@ proxy.get("/u/:customerId", async (req, res) => {
   const ini = initialsFor(profile?.first_name || "", profile?.last_name || "");
   const avatarSvg = svgAvatar(ini);
 
-  const posts = await listPostsForCustomer(targetId, 20);
+  const { posts } = await listPostsForCustomerWithMeta({
+    targetCustomerId: targetId,
+    viewerCustomerId: viewerId,
+    limit: 20,
+  });
+
   const postsHtml =
     posts.length === 0
       ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
       : `<div class="postList">
           ${posts
-            .map((p) => {
-              const body = escapeHtml(p.body || "");
-              const hasMedia = !!(p.media_mime && p.media_mime.trim());
-              const isVideo = hasMedia && p.media_mime.startsWith("video/");
-              const mediaUrl = `${base}/posts/${p.id}/media`;
-              const mediaHtml = !hasMedia
-                ? ""
-                : isVideo
-                  ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
-                  : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
-              const when = new Date(p.created_at).toLocaleString();
-
-              return `
-                <div class="postItem">
-                  <div class="postMeta">
-                    <span class="muted small">${escapeHtml(when)}</span>
-                  </div>
-                  ${body ? `<p style="margin:10px 0 0 0;white-space:pre-wrap">${body}</p>` : ""}
-                  ${mediaHtml}
-                </div>
-              `;
-            })
+            .map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: false, returnPath: `${base}/u/${encodeURIComponent(targetId)}` }))
             .join("")}
         </div>`;
 
@@ -859,16 +1299,21 @@ proxy.get("/u/:customerId", async (req, res) => {
   );
 });
 
+/** New post page */
 proxy.get("/post/new", async (req, res) => {
-  const customerId = getViewerCustomerId(req);
+  const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
-  if (!customerId) {
+  if (!viewerId) {
     return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
+
+  const r = typeof req.query.return === "string" ? req.query.return : "feed";
+  const returnTo =
+    r === "me" ? `${base}/me` : r === "feed" ? `${base}` : (r.startsWith("/") ? r : `${base}`);
 
   const status =
     req.query.err === "1"
@@ -878,7 +1323,7 @@ proxy.get("/post/new", async (req, res) => {
         : "";
 
   const postAction = `${base}/post/new`;
-  const cancelHref = `${base}/me`;
+  const cancelHref = returnTo;
 
   return res.type("html").send(
     page(
@@ -886,6 +1331,8 @@ proxy.get("/post/new", async (req, res) => {
         ${status}
         <div class="stack">
           <form method="POST" enctype="multipart/form-data" action="${postAction}">
+            <input type="hidden" name="return" value="${escapeHtml(returnTo)}" />
+
             <label for="body">Post</label>
             <textarea id="body" name="body" maxlength="500" placeholder="Write your post (max 500 characters)"></textarea>
             <div class="muted small help">0 to 500 characters.</div>
@@ -926,12 +1373,13 @@ proxy.get("/post/new", async (req, res) => {
   );
 });
 
+/** Create post */
 proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
   const shop = getShop(req);
-  const customerId = getViewerCustomerId(req);
+  const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
-  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!viewerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const body = cleanMultiline(req.body?.body, 500);
@@ -959,31 +1407,35 @@ proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
   const hasMedia = !!mediaBytes;
   if (!hasText && !hasMedia) return res.redirect(`${base}/post/new?err=1`);
 
+  const returnToRaw = cleanText(req.body?.return, 300);
+  const returnTo = returnToRaw && returnToRaw.startsWith("/") ? returnToRaw : `${base}`;
+
   try {
-    await ensureRow(customerId, shop);
-    await createPost({ shop, customerId, body, mediaBytes, mediaMime });
-    return res.redirect(`${base}/me`);
+    await ensureRow(viewerId, shop);
+    await createPost({ shop, customerId: viewerId, body, mediaBytes, mediaMime });
+    return res.redirect(returnTo);
   } catch (e) {
     console.error("create post error:", e);
     return res.redirect(`${base}/post/new?err=1`);
   }
 });
 
+/** Edit profile */
 proxy.get("/me/edit", async (req, res) => {
   const shop = getShop(req);
-  const customerId = getViewerCustomerId(req);
+  const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
-  if (!customerId) {
+  if (!viewerId) {
     return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
-  await ensureRow(customerId, shop);
+  await ensureRow(viewerId, shop);
 
-  const profile = await getProfile(customerId);
+  const profile = await getProfile(viewerId);
   const first = profile?.first_name || "";
   const last = profile?.last_name || "";
   const bio = profile?.bio || "";
@@ -1057,10 +1509,10 @@ proxy.get("/me/edit", async (req, res) => {
 
 proxy.post("/me/edit", async (req, res) => {
   const shop = getShop(req);
-  const customerId = getViewerCustomerId(req);
+  const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
-  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!viewerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const first_name = cleanText(req.body?.first_name, 40);
@@ -1069,8 +1521,8 @@ proxy.post("/me/edit", async (req, res) => {
   const bio = cleanMultiline(req.body?.bio, 500);
 
   try {
-    await ensureRow(customerId, shop);
-    await updateProfile(customerId, { first_name, last_name, social_url, bio });
+    await ensureRow(viewerId, shop);
+    await updateProfile(viewerId, { first_name, last_name, social_url, bio });
     return res.redirect(`${base}/me/edit`);
   } catch (e) {
     console.error("edit save error:", e);
@@ -1080,10 +1532,10 @@ proxy.post("/me/edit", async (req, res) => {
 
 proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
   const shop = getShop(req);
-  const customerId = getViewerCustomerId(req);
+  const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
-  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!viewerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const file = req.file;
@@ -1093,8 +1545,8 @@ proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
   if (!allowed.has(file.mimetype)) return res.redirect(`${base}/me/edit`);
 
   try {
-    await ensureRow(customerId, shop);
-    await updateProfile(customerId, { avatar_bytes: file.buffer, avatar_mime: file.mimetype });
+    await ensureRow(viewerId, shop);
+    await updateProfile(viewerId, { avatar_bytes: file.buffer, avatar_mime: file.mimetype });
     return res.redirect(`${base}/me/edit`);
   } catch (e) {
     console.error("avatar upload error:", e);
