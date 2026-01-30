@@ -512,7 +512,7 @@ function page(bodyHtml, reqForBase) {
       body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.35}
       a{color:inherit}
       .nav a{margin-right:12px}
-      .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:980px}
+      .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:none;width:100%}
       code{background:#f5f5f5;padding:2px 6px;border-radius:6px}
       .muted{opacity:.75}
       .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;background:white;cursor:pointer}
@@ -532,12 +532,12 @@ function page(bodyHtml, reqForBase) {
       .nameUnder{margin-top:10px;font-weight:800}
       .handleUnder{margin-top:4px}
       .small{font-size:13px}
-      .stack{width:100%;max-width:920px}
+      .stack{width:100%;max-width:none}
       .help{margin-top:6px}
 
       .brandBar{
         width:100%;
-        max-width:720px;
+        max-width:none;
         display:flex;
         justify-content:center;
         align-items:center;
@@ -552,7 +552,7 @@ function page(bodyHtml, reqForBase) {
 
       .composer{
         width:100%;
-        max-width:920px;
+        max-width:none;
         border:1px solid #eee;
         border-radius:12px;
         padding:12px;
@@ -621,7 +621,7 @@ function page(bodyHtml, reqForBase) {
       .collectionTitle{font-weight:800}
       .chev{opacity:.65}
 
-      .postList{width:100%;max-width:920px;margin-top:14px}
+      .postList{width:100%;max-width:none;margin-top:14px}
       .postItem{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:10px;background:#fff}
 
       .postHeader{
@@ -648,11 +648,12 @@ function page(bodyHtml, reqForBase) {
       .postAuthor{font-weight:800}
       .postMetaRight{display:flex;gap:10px;align-items:center}
 
+      /* MEDIA: make it as large as possible within the viewport */
       .mediaGrid{
         width:100%;
         display:grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap:8px;
+        grid-template-columns: 1fr; /* full width */
+        gap:10px;
         margin-top:10px;
       }
       .mediaTile{
@@ -667,11 +668,12 @@ function page(bodyHtml, reqForBase) {
       .mediaTile img, .mediaTile video{
         display:block;
         width:100%;
-        height:100%;
-        object-fit:cover;
-        aspect-ratio: 1 / 1;
+        height:auto;
+        max-height:70vh;
+        object-fit:contain;
+        aspect-ratio:auto;
       }
-      .mediaTile video{object-fit:cover}
+      .mediaTile video{object-fit:contain}
       .mediaBadge{
         position:absolute;
         right:8px;
@@ -758,8 +760,8 @@ function page(bodyHtml, reqForBase) {
       .lbInner{
         width:100%;
         height:100%;
-        max-width:980px;
-        max-height:980px;
+        max-width:none;
+        max-height:none;
         display:flex;
         flex-direction:column;
         gap:12px;
@@ -789,10 +791,11 @@ function page(bodyHtml, reqForBase) {
         border-radius:14px;
       }
       .lbStage img, .lbStage video{
+        width:100%;
+        height:100%;
         max-width:100%;
         max-height:100%;
-        width:auto;
-        height:auto;
+        object-fit:contain;
         border-radius:14px;
         display:block;
       }
