@@ -1,9 +1,6 @@
 // server.js (FULL FILE REPLACEMENT)
-// Change added:
-// - On /me (My Profile), add two clickable "media collections" cards between the composer and the timeline:
-//   1) Collection -> /collection
-//   2) Trades -> /trades
-// (Uses Shopify path_prefix via basePathFromReq)
+// Change:
+// - Remove the "Shop: <code>...</code>" footer from all pages (hidden).
 
 import express from "express";
 import crypto from "crypto";
@@ -158,8 +155,7 @@ function basePathFromReq(req) {
   return p && p.startsWith("/") ? p : "/apps/nuggetdepot";
 }
 
-function page(bodyHtml, shop, reqForBase) {
-  const safeShop = shop || "unknown";
+function page(bodyHtml, reqForBase) {
   const base = basePathFromReq(reqForBase);
 
   return `<!doctype html>
@@ -180,7 +176,6 @@ function page(bodyHtml, shop, reqForBase) {
       textarea{min-height:160px;resize:vertical}
       label{display:block;margin-top:12px;margin-bottom:6px}
       .error{color:#b00020}
-      .ok{color:#137333}
       hr{border:none;border-top:1px solid #eee;margin:12px 0}
       .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 
@@ -226,7 +221,6 @@ function page(bodyHtml, shop, reqForBase) {
         background:#fff;
       }
 
-      /* NEW: media collections row */
       .collectionsRow{
         width:100%;
         max-width:720px;
@@ -276,20 +270,14 @@ function page(bodyHtml, shop, reqForBase) {
     <hr/>
     <div class="card">
       ${bodyHtml}
-      <p class="muted">Shop: <code>${safeShop}</code></p>
     </div>
   </body>
 </html>`;
 }
 
 function requireProxyAuth(req, res, next) {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-
   if (!SHOPIFY_API_SECRET) {
-    return res
-      .status(200)
-      .type("html")
-      .send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop, req));
+    return res.status(200).type("html").send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, req));
   }
 
   if (!verifyShopifyProxy(req)) {
@@ -301,7 +289,6 @@ function requireProxyAuth(req, res, next) {
           <p class="muted">Path: <code>${req.originalUrl}</code></p>
           <p class="muted">Query keys: <code>${keys || "none"}</code></p>
         `,
-        shop,
         req
       )
     );
@@ -466,17 +453,14 @@ proxy.use(requireProxyAuth);
 
 /** Feed (placeholder) */
 proxy.get("/", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
   if (!customerId) {
-    return res
-      .type("html")
-      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
+    return res.type("html").send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
 
-  return res.type("html").send(page(`<p>Feed placeholder.</p>`, shop, req));
+  return res.type("html").send(page(`<p>Feed placeholder.</p>`, req));
 });
 
 /** Avatar */
@@ -528,7 +512,7 @@ proxy.get("/posts/:id/media", async (req, res) => {
   }
 });
 
-/** My Profile (shows post box ONLY here) */
+/** My Profile */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -536,14 +520,10 @@ proxy.get("/me", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!customerId) {
-    return res
-      .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(customerId, shop);
@@ -576,7 +556,6 @@ proxy.get("/me", async (req, res) => {
               const hasMedia = !!(p.media_mime && p.media_mime.trim());
               const isVideo = hasMedia && p.media_mime.startsWith("video/");
               const mediaUrl = `${base}/posts/${p.id}/media`;
-
               const mediaHtml = !hasMedia
                 ? ""
                 : isVideo
@@ -584,7 +563,6 @@ proxy.get("/me", async (req, res) => {
                   : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
 
               const when = new Date(p.created_at).toLocaleString();
-
               return `
                 <div class="postItem">
                   <div class="postMeta">
@@ -619,7 +597,6 @@ proxy.get("/me", async (req, res) => {
               <div class="muted small help">500 characters max. Media optional.</div>
             </div>
 
-            <!-- NEW: media collections (between composer and timeline) -->
             <div class="collectionsRow">
               <a class="collectionCard" href="${collectionHref}" aria-label="Go to Collection">
                 <div>
@@ -642,13 +619,12 @@ proxy.get("/me", async (req, res) => {
           </div>
         </div>
       `,
-      shop,
       req
     )
   );
 });
 
-/** Public profile: /u/:customerId (no post box) */
+/** Public profile */
 proxy.get("/u/:customerId", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const viewerId =
@@ -656,27 +632,19 @@ proxy.get("/u/:customerId", async (req, res) => {
   const base = basePathFromReq(req);
 
   const targetId = String(req.params.customerId || "").trim();
-  if (!targetId) return res.type("html").send(page(`<p class="error">Missing user.</p>`, shop, req));
+  if (!targetId) return res.type("html").send(page(`<p class="error">Missing user.</p>`, req));
 
-  if (viewerId && targetId === viewerId) {
-    return res.redirect(`${base}/me`);
-  }
+  if (viewerId && targetId === viewerId) return res.redirect(`${base}/me`);
 
   if (!viewerId) {
-    return res
-      .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   const profile = await getProfile(targetId);
-  if (!profile) {
-    return res.type("html").send(page(`<p class="error">User not found.</p>`, shop, req));
-  }
+  if (!profile) return res.type("html").send(page(`<p class="error">User not found.</p>`, req));
 
   const displayName =
     `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
@@ -704,8 +672,8 @@ proxy.get("/u/:customerId", async (req, res) => {
                 : isVideo
                   ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
                   : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
-              const when = new Date(p.created_at).toLocaleString();
 
+              const when = new Date(p.created_at).toLocaleString();
               return `
                 <div class="postItem">
                   <div class="postMeta">
@@ -725,9 +693,7 @@ proxy.get("/u/:customerId", async (req, res) => {
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
-              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(
-                avatarSvg
-              )}" alt="Profile photo" />
+              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(avatarSvg)}" alt="Profile photo" />
             </div>
 
             <div class="nameUnder">${escapeHtml(displayName)}</div>
@@ -737,7 +703,6 @@ proxy.get("/u/:customerId", async (req, res) => {
           </div>
         </div>
       `,
-      shop,
       req
     )
   );
@@ -751,24 +716,18 @@ proxy.get("/post/new", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!customerId) {
-    return res
-      .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   const status =
     req.query.err === "1"
       ? `<p class="error">Add text or media.</p>`
-      : req.query.toobig === "1"
-        ? `<p class="error">Media too large. Max 15MB.</p>`
-        : req.query.type === "1"
-          ? `<p class="error">Unsupported file type.</p>`
-          : "";
+      : req.query.type === "1"
+        ? `<p class="error">Unsupported file type.</p>`
+        : "";
 
   const postAction = `${base}/post/new`;
   const cancelHref = `${base}/me`;
@@ -817,7 +776,6 @@ proxy.get("/post/new", async (req, res) => {
           })();
         </script>
       `,
-      shop,
       req
     )
   );
@@ -850,9 +808,7 @@ proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
       "video/quicktime",
     ]);
 
-    if (!allowed.has(file.mimetype)) {
-      return res.redirect(`${base}/post/new?type=1`);
-    }
+    if (!allowed.has(file.mimetype)) return res.redirect(`${base}/post/new?type=1`);
 
     mediaBytes = file.buffer;
     mediaMime = file.mimetype;
@@ -861,9 +817,7 @@ proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
   const hasText = !!(body && body.trim());
   const hasMedia = !!mediaBytes;
 
-  if (!hasText && !hasMedia) {
-    return res.redirect(`${base}/post/new?err=1`);
-  }
+  if (!hasText && !hasMedia) return res.redirect(`${base}/post/new?err=1`);
 
   try {
     await ensureRow(customerId, shop);
@@ -883,14 +837,10 @@ proxy.get("/me/edit", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!customerId) {
-    return res
-      .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(customerId, shop);
@@ -915,13 +865,7 @@ proxy.get("/me/edit", async (req, res) => {
               <img class="avatar" src="${avatarSrc}" alt="Profile photo" />
 
               <form id="avatarForm" method="POST" enctype="multipart/form-data" action="${avatarAction}">
-                <input
-                  id="avatarInput"
-                  class="fileInput"
-                  type="file"
-                  name="avatar"
-                  accept="image/png,image/jpeg,image/webp"
-                />
+                <input id="avatarInput" class="fileInput" type="file" name="avatar" accept="image/png,image/jpeg,image/webp" />
               </form>
 
               <button class="avatarEdit" type="button" id="avatarBtn" aria-label="Change profile photo">✎</button>
@@ -939,14 +883,10 @@ proxy.get("/me/edit", async (req, res) => {
               <input id="last_name" name="last_name" value="${escapeHtml(last)}" required />
 
               <label for="social_url">Social link</label>
-              <input id="social_url" name="social_url" value="${escapeHtml(
-                social_url
-              )}" placeholder="https://instagram.com/yourname" />
+              <input id="social_url" name="social_url" value="${escapeHtml(social_url)}" placeholder="https://instagram.com/yourname" />
 
               <label for="bio">Bio</label>
-              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(
-                bio
-              )}</textarea>
+              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(bio)}</textarea>
 
               <div class="row">
                 <button class="btn" type="submit">Save</button>
@@ -964,7 +904,6 @@ proxy.get("/me/edit", async (req, res) => {
             const input = document.getElementById('avatarInput');
             const form = document.getElementById('avatarForm');
             if (!btn || !input || !form) return;
-
             btn.addEventListener('click', () => input.click());
             input.addEventListener('change', () => {
               if (!input.files || !input.files[0]) return;
@@ -973,7 +912,6 @@ proxy.get("/me/edit", async (req, res) => {
           })();
         </script>
       `,
-      shop,
       req
     )
   );
@@ -1028,15 +966,8 @@ proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
   }
 });
 
-proxy.get("/collection", (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(page(`<p>Collection placeholder.</p>`, shop, req));
-});
-
-proxy.get("/trades", (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(page(`<p>Trades placeholder.</p>`, shop, req));
-});
+proxy.get("/collection", (_req, res) => res.type("html").send(page(`<p>Collection placeholder.</p>`, _req)));
+proxy.get("/trades", (_req, res) => res.type("html").send(page(`<p>Trades placeholder.</p>`, _req)));
 
 app.use("/proxy", proxy);
 
