@@ -143,8 +143,29 @@ function page(title, bodyHtml, shop, nav = true) {
       hr{border:none;border-top:1px solid #eee;margin:12px 0}
       .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
       .center{max-width:520px}
-      .profileTop{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
-      .avatarWrap{width:120px}
+
+      /* Center profile + move it up */
+      .profileTop{
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        justify-content:flex-start;
+        gap:14px;
+      }
+      .avatarWrap{
+        width:100%;
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        margin-top:6px;
+      }
+
+      /* Avatar with overlay edit button */
+      .avatarBox{
+        position:relative;
+        width:120px;
+        height:120px;
+      }
       .avatar{
         width:120px;height:120px;
         border-radius:16px;
@@ -154,6 +175,33 @@ function page(title, bodyHtml, shop, nav = true) {
         background:#fafafa;
         display:block;
       }
+      .avatarEdit{
+        position:absolute;
+        right:-8px;
+        bottom:-8px;
+        width:34px;
+        height:34px;
+        border-radius:10px;
+        border:1px solid #ddd;
+        background:#fff;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        cursor:pointer;
+        box-shadow:0 2px 10px rgba(0,0,0,.06);
+      }
+      .fileInput{
+        position:absolute;
+        width:1px;
+        height:1px;
+        padding:0;
+        margin:-1px;
+        overflow:hidden;
+        clip:rect(0,0,0,0);
+        white-space:nowrap;
+        border:0;
+      }
+
       .nameUnder{margin-top:10px;font-weight:700}
       .subUnder{margin-top:2px}
       .small{font-size:13px}
@@ -423,12 +471,27 @@ proxy.get("/me", async (req, res) => {
 
         <div class="profileTop">
           <div class="avatarWrap">
-            <img class="avatar" src="${avatarSrc}" alt="Profile photo" />
+            <div class="avatarBox">
+              <img class="avatar" src="${avatarSrc}" alt="Profile photo" />
+
+              <form id="avatarForm" method="POST" enctype="multipart/form-data" action="/apps/nuggetdepot/me/avatar?${qs}">
+                <input
+                  id="avatarInput"
+                  class="fileInput"
+                  type="file"
+                  name="avatar"
+                  accept="image/png,image/jpeg,image/webp"
+                />
+              </form>
+
+              <button class="avatarEdit" type="button" id="avatarBtn" aria-label="Change profile photo">✎</button>
+            </div>
+
             <div class="nameUnder">${displayName}</div>
             <div class="muted subUnder small">Community profile</div>
           </div>
 
-          <div style="min-width:260px;flex:1">
+          <div style="min-width:260px;flex:1;width:100%;max-width:520px">
             <div class="grid">
               <div class="k">Customer ID</div><div><code>${customerId}</code></div>
               <div class="k">Username</div><div>${profile?.username ? `<strong>${profile.username}</strong>` : `<span class="muted">Not set</span>`}</div>
@@ -446,17 +509,23 @@ proxy.get("/me", async (req, res) => {
 
               <button class="btn" type="submit">Save name</button>
             </form>
-
-            <hr/>
-
-            <h3 style="margin:0 0 6px 0">Update profile photo</h3>
-            <form method="POST" enctype="multipart/form-data" action="/apps/nuggetdepot/me/avatar?${qs}">
-              <input type="file" name="avatar" accept="image/png,image/jpeg,image/webp" required />
-              <div class="muted small">Square recommended. Max 2MB. PNG, JPG, or WEBP.</div>
-              <button class="btn" type="submit">Upload photo</button>
-            </form>
           </div>
         </div>
+
+        <script>
+          (function(){
+            const btn = document.getElementById('avatarBtn');
+            const input = document.getElementById('avatarInput');
+            const form = document.getElementById('avatarForm');
+            if (!btn || !input || !form) return;
+
+            btn.addEventListener('click', () => input.click());
+            input.addEventListener('change', () => {
+              if (!input.files || !input.files[0]) return;
+              form.submit();
+            });
+          })();
+        </script>
       `,
       shop
     )
@@ -489,7 +558,6 @@ proxy.post("/me/name", async (req, res) => {
 
 /** Upload avatar */
 proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
@@ -503,7 +571,6 @@ proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
   if (!allowed.has(file.mimetype)) return res.redirect(`/apps/nuggetdepot/me?imgerr=1&${qs}`);
 
   try {
-    await ensureRow(customerId, shop);
     await updateProfile(customerId, {
       avatar_bytes: file.buffer,
       avatar_mime: file.mimetype,
