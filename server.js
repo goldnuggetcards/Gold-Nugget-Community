@@ -11,6 +11,10 @@ app.use((req, res, next) => {
 });
 
 const SHOPIFY_API_SECRET = (process.env.SHOPIFY_API_SECRET || "").trim();
+const SHOPIFY_ADMIN_ACCESS_TOKEN = (process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || "").trim();
+const SHOPIFY_SHOP_DOMAIN = (process.env.SHOPIFY_SHOP_DOMAIN || "").trim();
+const SHOPIFY_API_VERSION = (process.env.SHOPIFY_API_VERSION || "2026-01").trim();
+
 const PORT = Number(process.env.PORT) || 3000;
 
 function buildProxyMessage(query) {
@@ -61,9 +65,12 @@ function page(title, bodyHtml, shop) {
       body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.35}
       a{color:inherit}
       .nav a{margin-right:12px}
-      .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:820px}
+      .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:860px}
       code{background:#f5f5f5;padding:2px 6px;border-radius:6px}
       .muted{opacity:.75}
+      .grid{display:grid;grid-template-columns:180px 1fr;gap:8px 16px;margin-top:12px}
+      .k{opacity:.75}
+      .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none}
     </style>
   </head>
   <body>
@@ -77,17 +84,38 @@ function page(title, bodyHtml, shop) {
     <div class="card">
       <h1>${title}</h1>
       ${bodyHtml}
-      ${
-        shop
-          ? `<p class="muted">Shop: <code>${shop}</code></p>`
-          : `<p class="muted">Shop: <code>unknown</code></p>`
-      }
+      <p class="muted">Shop: <code>${shop || "unknown"}</code></p>
     </div>
   </body>
 </html>`;
 }
 
-// Root page (so your Render URL doesn't show "Not found")
+async function shopifyGraphQL({ query, variables }) {
+  if (!SHOPIFY_SHOP_DOMAIN) throw new Error("Missing SHOPIFY_SHOP_DOMAIN");
+  if (!SHOPIFY_ADMIN_ACCESS_TOKEN) throw new Error("Missing SHOPIFY_ADMIN_ACCESS_TOKEN");
+
+  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const json = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    throw new Error(`Shopify Admin API HTTP ${resp.status}: ${JSON.stringify(json)}`);
+  }
+  if (json.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  }
+  return json.data;
+}
+
+// Root page (Render)
 app.get("/", (req, res) => {
   res.type("html").send(`
     <h1>Nugget Depot</h1>
@@ -102,7 +130,7 @@ app.get("/", (req, res) => {
 // Health check for Render
 app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 
-// Proxy routes (Shopify App Proxy should point to https://YOUR_SERVER_DOMAIN/proxy)
+// Proxy routes
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
@@ -111,85 +139,81 @@ proxy.get("/", (req, res) => {
   res.type("html").send(
     page(
       "Nugget Depot",
-      `
-        <p>Proxy working.</p>
-        <p>Use the navigation above to explore the sections.</p>
-      `,
+      `<p>Proxy working.</p><p>Use the navigation above.</p>`,
       shop
     )
   );
 });
 
-proxy.get("/me", (req, res) => {
+// My Profile (functional)
+proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(
-    page(
-      "My Profile",
-      `
-        <p>Next: show logged-in customer profile details.</p>
-        <ul>
-          <li>Username</li>
-          <li>Saved searches</li>
-          <li>Wishlist and watchlist settings</li>
-        </ul>
+  const loggedInCustomerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+
+  // If customer not logged in, Shopify sets this blank. :contentReference[oaicite:1]{index=1}
+  if (!loggedInCustomerId) {
+    return res.type("html").send(
+      page(
+        "My Profile",
+        `
+          <p>You are not logged in.</p>
+          <a class="btn" href="/account/login">Log in</a>
+        `,
+        shop
+      )
+    );
+  }
+
+  try {
+    const data = await shopifyGraphQL({
+      query: `
+        query GetCustomer($id: ID!) {
+          customer(id: $id) {
+            id
+            firstName
+            lastName
+            email
+            phone
+            createdAt
+            defaultAddress {
+              city
+              province
+              country
+            }
+            metafield(namespace: "nuggetdepot", key: "username") {
+              value
+            }
+          }
+        }
       `,
-      shop
-    )
-  );
-});
+      variables: { id: `gid://shopify/Customer/${loggedInCustomerId}` },
+    });
 
-proxy.get("/collection", (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(
-    page(
-      "My Collection",
-      `
-        <p>Next: list saved cards, grades, notes, and estimated value.</p>
-        <ul>
-          <li>Recently added</li>
-          <li>By set/era</li>
-          <li>By grade</li>
-        </ul>
-      `,
-      shop
-    )
-  );
-});
+    const c = data?.customer;
+    if (!c) {
+      return res.status(404).type("html").send(
+        page(
+          "My Profile",
+          `<p>Customer not found for this session.</p>`,
+          shop
+        )
+      );
+    }
 
-proxy.get("/trades", (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(
-    page(
-      "Trades",
-      `
-        <p>Next: create trade listings and browse offers.</p>
-        <ul>
-          <li>Create a listing</li>
-          <li>Browse listings</li>
-          <li>Messages/offers</li>
-        </ul>
-      `,
-      shop
-    )
-  );
-});
+    const username =
+      (c.metafield?.value || "").trim() ||
+      [c.firstName, c.lastName].filter(Boolean).join(" ").trim() ||
+      `Trainer ${String(loggedInCustomerId).slice(-4)}`;
 
-app.use("/proxy", proxy);
+    const address = c.defaultAddress
+      ? [c.defaultAddress.city, c.defaultAddress.province, c.defaultAddress.country]
+          .filter(Boolean)
+          .join(", ")
+      : "";
 
-// 404 fallback
-app.use((req, res) => res.status(404).type("text").send("Not found"));
-
-// Ensure Render sees a bound port
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on 0.0.0.0:${PORT}`);
-});
-
-// Helpful for graceful shutdowns on Render
-process.on("SIGTERM", () => {
-  console.log("SIGTERM received, shutting down...");
-  server.close(() => process.exit(0));
-});
-process.on("SIGINT", () => {
-  console.log("SIGINT received, shutting down...");
-  server.close(() => process.exit(0));
-});
+    return res.type("html").send(
+      page(
+        "My Profile",
+        `
+          <p>Welcome, <strong>${username}</strong>.</p>
