@@ -131,12 +131,13 @@ proxy.use(requireProxyAuth);
 
 proxy.get("/", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(page("Nugget Depot", `<p>Proxy working.</p><p>Use the navigation above.</p>`, shop));
+  res
+    .type("html")
+    .send(page("Nugget Depot", `<p>Proxy working.</p><p>Use the navigation above.</p>`, shop));
 });
 
 function cleanUsername(input) {
   const u = String(input || "").trim();
-  // 3–20 chars, letters/numbers/_/./-
   if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(u)) return "";
   return u;
 }
@@ -173,7 +174,13 @@ proxy.get("/me", async (req, res) => {
   if (!customerId) {
     return res
       .type("html")
-      .send(page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
+      .send(
+        page(
+          "My Profile",
+          `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`,
+          shop
+        )
+      );
   }
 
   const username = await getUsername(shop, customerId);
@@ -182,7 +189,14 @@ proxy.get("/me", async (req, res) => {
     ? ""
     : `<p class="error">DATABASE_URL not set. Create Render Postgres and add DATABASE_URL to the web service.</p>`;
 
-  const status = saved ? `<p class="ok">Saved.</p>` : err ? `<p class="error">Invalid username.</p>` : "";
+  const status = saved
+    ? `<p class="ok">Saved.</p>`
+    : err
+      ? `<p class="error">Invalid username.</p>`
+      : "";
+
+  // IMPORTANT: carry forward the signed proxy query params so POST is still signed
+  const signedQs = new URLSearchParams(req.query).toString();
 
   res.type("html").send(
     page(
@@ -196,7 +210,7 @@ proxy.get("/me", async (req, res) => {
           <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
         </div>
 
-        <form method="POST" action="/apps/nuggetdepot/me/username">
+        <form method="POST" action="/apps/nuggetdepot/me/username?${signedQs}">
           <label for="username">Set username</label>
           <input id="username" name="username" placeholder="ex: nuggetking" value="${username || ""}" />
           <div class="muted">3–20 characters. Letters, numbers, underscore, dash, dot.</div>
@@ -227,7 +241,10 @@ proxy.post("/me/username", async (req, res) => {
     return res.redirect("/apps/nuggetdepot/me?saved=1");
   } catch (e) {
     console.error(e);
-    return res.status(500).type("html").send(page("My Profile", `<p class="error">Could not save. Check DATABASE_URL.</p>`, shop));
+    return res
+      .status(500)
+      .type("html")
+      .send(page("My Profile", `<p class="error">Could not save. Check DATABASE_URL.</p>`, shop));
   }
 });
 
