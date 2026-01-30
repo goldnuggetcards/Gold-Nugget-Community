@@ -1,8 +1,10 @@
 // server.js (FULL FILE REPLACEMENT)
-// Changes:
-// - Ensure avatar upload always creates row first
-// - Save on /me/edit redirects back to /me/edit?saved=1 so the edit page confirms save
-// - "Done" button on edit page goes back to /me (profile) and shows updates there
+// Goal: keep it simple and make navigation work reliably.
+// - Clicking the edit icon on /me goes to /me/edit
+// - Clicking Done on /me/edit goes back to /me
+// Implementation detail:
+// - Do NOT carry forward the signed querystring in links/forms/images
+// - Use Shopify’s `path_prefix` to build links (falls back to /apps/nuggetdepot)
 
 import express from "express";
 import crypto from "crypto";
@@ -54,34 +56,26 @@ async function ensureSchema() {
     );
   `);
 
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
 
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`);
 
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
 
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS dob DATE`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`
-  );
+  // Backfill NULLs for older schemas
+  await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET social_url = '' WHERE social_url IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET avatar_mime = '' WHERE avatar_mime IS NULL`);
 
+  // Defaults + not null
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET DEFAULT ''`);
@@ -90,17 +84,6 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN bio SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET DEFAULT ''`);
-
-  await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
-  await pool.query(
-    `UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`
-  );
-  await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET social_url = '' WHERE social_url IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET avatar_mime = '' WHERE avatar_mime IS NULL`);
 
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET NOT NULL`);
@@ -140,8 +123,44 @@ function verifyShopifyProxy(req) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function page(_title, bodyHtml, shop, nav = true) {
+function requireProxyAuth(req, res, next) {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+
+  if (!SHOPIFY_API_SECRET) {
+    return res.status(200).type("html").send(
+      page("", `<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop, true, req)
+    );
+  }
+
+  if (!verifyShopifyProxy(req)) {
+    const keys = Object.keys(req.query || {}).sort().join(", ");
+    return res.status(200).type("html").send(
+      page(
+        "",
+        `
+          <p class="error">Invalid proxy signature.</p>
+          <p class="muted">Path: <code>${req.originalUrl}</code></p>
+          <p class="muted">Query keys: <code>${keys || "none"}</code></p>
+        `,
+        shop,
+        true,
+        req
+      )
+    );
+  }
+
+  return next();
+}
+
+function basePathFromReq(req) {
+  const p = typeof req.query.path_prefix === "string" ? req.query.path_prefix : "";
+  return p && p.startsWith("/") ? p : "/apps/nuggetdepot";
+}
+
+function page(_title, bodyHtml, shop, nav = true, reqForBase = null) {
   const safeShop = shop || "unknown";
+  const base = reqForBase ? basePathFromReq(reqForBase) : "/apps/nuggetdepot";
+
   return `<!doctype html>
 <html>
   <head>
@@ -163,7 +182,6 @@ function page(_title, bodyHtml, shop, nav = true) {
       .ok{color:#137333}
       hr{border:none;border-top:1px solid #eee;margin:12px 0}
       .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-      .center{max-width:520px}
 
       .profileTop{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:14px}
       .avatarWrap{width:100%;display:flex;flex-direction:column;align-items:center;margin-top:6px}
@@ -181,13 +199,13 @@ function page(_title, bodyHtml, shop, nav = true) {
   <body>
     ${nav ? `
     <div class="nav">
-      <a href="/apps/nuggetdepot">Feed</a>
-      <a href="/apps/nuggetdepot/me">My Profile</a>
-      <a href="/apps/nuggetdepot/collection">My Collection</a>
-      <a href="/apps/nuggetdepot/trades">Trades</a>
+      <a href="${base}">Feed</a>
+      <a href="${base}/me">My Profile</a>
+      <a href="${base}/collection">My Collection</a>
+      <a href="${base}/trades">Trades</a>
     </div>
     <hr/>` : ``}
-    <div class="card ${nav ? "" : "center"}">
+    <div class="card">
       ${bodyHtml}
       <p class="muted">Shop: <code>${safeShop}</code></p>
     </div>
@@ -195,54 +213,18 @@ function page(_title, bodyHtml, shop, nav = true) {
 </html>`;
 }
 
-function requireProxyAuth(req, res, next) {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-
-  if (!SHOPIFY_API_SECRET) {
-    return res
-      .status(200)
-      .type("html")
-      .send(page("Config error", `<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop));
-  }
-
-  if (!verifyShopifyProxy(req)) {
-    const keys = Object.keys(req.query || {}).sort().join(", ");
-    return res.status(200).type("html").send(
-      page(
-        "Proxy auth failed",
-        `
-          <p class="error">Invalid proxy signature.</p>
-          <p class="muted">Path: <code>${req.originalUrl}</code></p>
-          <p class="muted">Query keys: <code>${keys || "none"}</code></p>
-          <p class="muted small">If this page appears, Shopify is reaching your server but the proxy signature check is failing.</p>
-        `,
-        shop
-      )
-    );
-  }
-
-  return next();
-}
-
-function signedQueryString(req) {
-  return new URLSearchParams(req.query).toString();
-}
-
 function cleanText(input, max = 80) {
   return String(input || "").trim().slice(0, max);
 }
-
 function cleanMultiline(input, max = 400) {
   return String(input || "").replace(/\r\n/g, "\n").trim().slice(0, max);
 }
-
 function initialsFor(first, last) {
   const a = (first || "").trim().slice(0, 1).toUpperCase();
   const b = (last || "").trim().slice(0, 1).toUpperCase();
   const x = `${a}${b}`.trim();
   return x || "GN";
 }
-
 function svgAvatar(initials) {
   const safe = String(initials || "GN").replace(/[^A-Z0-9]/g, "").slice(0, 2) || "GN";
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -253,7 +235,6 @@ function svgAvatar(initials) {
         font-size="84" fill="#111">${safe}</text>
 </svg>`;
 }
-
 function safeHandle(username) {
   const u = String(username || "").trim();
   if (!u) return "";
@@ -264,8 +245,7 @@ async function getProfile(customerId) {
   if (!pool) return null;
   await ensureSchema();
   const r = await pool.query(
-    `SELECT customer_id, shop, username, full_name, dob, favorite_pokemon,
-            first_name, last_name, bio, social_url, avatar_mime
+    `SELECT customer_id, shop, username, first_name, last_name, bio, social_url, avatar_mime
      FROM profiles_v2
      WHERE customer_id=$1`,
     [customerId]
@@ -312,6 +292,7 @@ async function updateProfile(customerId, patch) {
   const sets = [];
   const vals = [];
   let i = 1;
+
   for (const k of keys) {
     sets.push(`${k}=$${i++}`);
     vals.push(patch[k]);
@@ -324,6 +305,7 @@ async function updateProfile(customerId, patch) {
   );
 }
 
+/** Non-proxy root */
 app.get("/", (req, res) => {
   res.type("html").send(`
     <h1>Nugget Depot</h1>
@@ -334,42 +316,31 @@ app.get("/", (req, res) => {
     </ul>
   `);
 });
-
 app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 
+/** Proxy */
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
+/** Feed */
 proxy.get("/", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
   if (!customerId) {
     return res.type("html").send(
-      page(
-        "Feed",
-        `<p>Please log in to view the community feed.</p>
-         <a class="btn" href="/account/login">Log in</a>`,
-        shop
-      )
+      page("", `<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req)
     );
   }
 
   return res.type("html").send(
-    page(
-      "Feed",
-      `<p>Feed placeholder.</p>
-       <p class="muted">Next: posts table, image uploads, likes/comments.</p>`,
-      shop
-    )
+    page("", `<p>Feed placeholder.</p>`, shop, true, req)
   );
 });
 
+/** Avatar */
 proxy.get("/me/avatar", async (req, res) => {
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   if (!customerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
@@ -392,42 +363,39 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
+/** My Profile */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-  const qs = signedQueryString(req);
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const base = basePathFromReq(req);
 
   if (!customerId) {
-    return res
-      .type("html")
-      .send(page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
+    return res.type("html").send(
+      page("", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req)
+    );
   }
-
   if (!pool) {
-    return res
-      .type("html")
-      .send(page("My Profile", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop));
+    return res.type("html").send(
+      page("", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, true, req)
+    );
   }
 
   await ensureRow(customerId, shop);
 
   const profile = await getProfile(customerId);
-  const first = profile?.first_name || "";
-  const last = profile?.last_name || "";
-  const displayName = `${first} ${last}`.trim() || "Name not set";
+  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
 
   const handle = safeHandle(profile?.username);
   const handleLine = handle
     ? `<div class="muted handleUnder">${handle}</div>`
     : `<div class="muted handleUnder">Username not set</div>`;
 
-  const avatarSrc = `/apps/nuggetdepot/me/avatar?${qs}`;
-  const editHref = `/apps/nuggetdepot/me/edit?${qs}`;
+  const avatarSrc = `${base}/me/avatar`;
+  const editHref = `${base}/me/edit`;
 
   return res.type("html").send(
     page(
-      "My Profile",
+      "",
       `
         <div class="profileTop">
           <div class="avatarWrap">
@@ -438,34 +406,31 @@ proxy.get("/me", async (req, res) => {
 
             <div class="nameUnder">${displayName}</div>
             ${handleLine}
-
-            <div class="help small muted" style="margin-top:10px">
-              <a href="${editHref}">Edit profile</a>
-            </div>
           </div>
         </div>
       `,
-      shop
+      shop,
+      true,
+      req
     )
   );
 });
 
+/** Edit */
 proxy.get("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-  const qs = signedQueryString(req);
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const base = basePathFromReq(req);
 
   if (!customerId) {
-    return res
-      .type("html")
-      .send(page("Edit Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
+    return res.type("html").send(
+      page("", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req)
+    );
   }
-
   if (!pool) {
-    return res
-      .type("html")
-      .send(page("Edit Profile", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop));
+    return res.type("html").send(
+      page("", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, true, req)
+    );
   }
 
   await ensureRow(customerId, shop);
@@ -476,29 +441,21 @@ proxy.get("/me/edit", async (req, res) => {
   const bio = profile?.bio || "";
   const social_url = profile?.social_url || "";
 
-  const avatarSrc = `/apps/nuggetdepot/me/avatar?${qs}`;
-
-  const status =
-    req.query.saved === "1"
-      ? `<p class="ok">Saved.</p>`
-      : req.query.err === "1"
-        ? `<p class="error">Please check your inputs.</p>`
-        : req.query.imgerr === "1"
-          ? `<p class="error">Upload a PNG, JPG, or WEBP under 2MB.</p>`
-          : "";
+  const avatarSrc = `${base}/me/avatar`;
+  const saveAction = `${base}/me/edit`;
+  const avatarAction = `${base}/me/avatar`;
+  const doneHref = `${base}/me`;
 
   return res.type("html").send(
     page(
-      "Edit Profile",
+      "",
       `
-        ${status}
-
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
               <img class="avatar" src="${avatarSrc}" alt="Profile photo" />
 
-              <form id="avatarForm" method="POST" enctype="multipart/form-data" action="/apps/nuggetdepot/me/avatar?${qs}">
+              <form id="avatarForm" method="POST" enctype="multipart/form-data" action="${avatarAction}">
                 <input
                   id="avatarInput"
                   class="fileInput"
@@ -515,7 +472,7 @@ proxy.get("/me/edit", async (req, res) => {
           </div>
 
           <div class="stack">
-            <form method="POST" action="/apps/nuggetdepot/me/edit?${qs}">
+            <form method="POST" action="${saveAction}">
               <label for="first_name">First name</label>
               <input id="first_name" name="first_name" value="${first}" required />
 
@@ -530,7 +487,7 @@ proxy.get("/me/edit", async (req, res) => {
 
               <div class="row">
                 <button class="btn" type="submit">Save</button>
-                <a class="btn" href="/apps/nuggetdepot/me?${qs}">Done</a>
+                <a class="btn" href="${doneHref}">Done</a>
               </div>
 
               <div class="muted small help">Photo max 2MB. PNG, JPG, or WEBP.</div>
@@ -553,16 +510,17 @@ proxy.get("/me/edit", async (req, res) => {
           })();
         </script>
       `,
-      shop
+      shop,
+      true,
+      req
     )
   );
 });
 
 proxy.post("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-  const qs = signedQueryString(req);
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const base = basePathFromReq(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
@@ -572,56 +530,50 @@ proxy.post("/me/edit", async (req, res) => {
   const social_url = cleanText(req.body?.social_url, 220);
   const bio = cleanMultiline(req.body?.bio, 500);
 
-  if (!first_name || !last_name) return res.redirect(`/apps/nuggetdepot/me/edit?err=1&${qs}`);
+  if (!first_name || !last_name) return res.redirect(`${base}/me/edit`);
 
   try {
     await ensureRow(customerId, shop);
     await updateProfile(customerId, { first_name, last_name, social_url, bio });
-    return res.redirect(`/apps/nuggetdepot/me/edit?saved=1&${qs}`);
+    return res.redirect(`${base}/me/edit`);
   } catch (e) {
     console.error("edit save error:", e);
-    return res.redirect(`/apps/nuggetdepot/me/edit?err=1&${qs}`);
+    return res.redirect(`${base}/me/edit`);
   }
 });
 
 proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-  const qs = signedQueryString(req);
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const base = basePathFromReq(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const file = req.file;
-  if (!file || !file.buffer || !file.mimetype)
-    return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
+  if (!file || !file.buffer || !file.mimetype) return res.redirect(`${base}/me/edit`);
 
   const allowed = new Set(["image/png", "image/jpeg", "image/webp"]);
-  if (!allowed.has(file.mimetype))
-    return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
+  if (!allowed.has(file.mimetype)) return res.redirect(`${base}/me/edit`);
 
   try {
     await ensureRow(customerId, shop);
-    await updateProfile(customerId, {
-      avatar_bytes: file.buffer,
-      avatar_mime: file.mimetype,
-    });
-    return res.redirect(`/apps/nuggetdepot/me/edit?saved=1&${qs}`);
+    await updateProfile(customerId, { avatar_bytes: file.buffer, avatar_mime: file.mimetype });
+    return res.redirect(`${base}/me/edit`);
   } catch (e) {
     console.error("avatar upload error:", e);
-    return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
+    return res.redirect(`${base}/me/edit`);
   }
 });
 
 proxy.get("/collection", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(page("My Collection", `<p>Next: saved cards, grades, notes.</p>`, shop));
+  res.type("html").send(page("", `<p>Collection placeholder.</p>`, shop, true, req));
 });
 
 proxy.get("/trades", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(page("Trades", `<p>Next: listings, offers, messages.</p>`, shop));
+  res.type("html").send(page("", `<p>Trades placeholder.</p>`, shop, true, req));
 });
 
 app.use("/proxy", proxy);
