@@ -1,20 +1,16 @@
 // server.js (FULL FILE REPLACEMENT)
-// Adds Social Feed MVP:
-// - Feed page (/proxy/) shows composer + global timeline (latest first)
-// - Posts support optional caption (500 max) + optional media (photo/video)
-// - Like + comment on feed posts (also enabled anywhere posts are rendered)
-// - Feed supports endless scroll via /feed/more?cursor=...
-// - Posts created from anywhere can redirect back via /post/new?return=feed|me|<path>
-// - Uses signed-cookie session so links stay clean (no signed querystring in URLs)
-// - Removes "Shop: ..." from all pages
-// UPDATE:
-// - Comment rows show larger profile picture next to the commenter name (2.5x previous)
-//   Uses /proxy/avatar/:customerId (requires login) with safe fallback to SVG initials.
-// - Post header shows profile picture next to the post author name (same sizing as comments)
-// - Comment text starts aligned under the commenter's name (not near the profile pic)
-// - Feed top shows Gold Nugget logo (half-size)
-// - Prevent HTML caching (no 304s for proxy pages)
-// - Server logs do not include querystring (hides proxy signature noise)
+// Social Feed MVP + Updates:
+// - Hearts for likes (visible on mobile)
+// - Fullscreen media viewer (tap any image/video preview)
+// - Multi-media posts (upload multiple photos/videos per post) across all pages
+// - Collection page start (/proxy/collection):
+//   - Composer like /me, but requires at least 1 media file
+//   - Media timeline grid (2 columns on desktop and mobile)
+//   - Tap media to open fullscreen
+//
+// Notes:
+// - Adds post_media_v1 table for multi-media.
+// - Auto-migrates legacy single media (posts_v1.media_bytes) into post_media_v1 (idx=0) when missing.
 
 import express from "express";
 import crypto from "crypto";
@@ -60,7 +56,8 @@ const uploadAvatar = multer({
 
 const uploadPostMedia = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+  // Limit is per-file for multer; keep conservative.
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB per file
 });
 
 async function ensureSchema() {
@@ -115,7 +112,7 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET NOT NULL`);
 
-  // Posts
+  // Posts (legacy single media columns kept for migration compatibility)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS posts_v1 (
       id BIGSERIAL PRIMARY KEY,
@@ -141,6 +138,31 @@ async function ensureSchema() {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS posts_v1_customer_created_idx ON posts_v1 (customer_id, created_at DESC, id DESC)`
   );
+
+  // Multi-media for posts
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS post_media_v1 (
+      id BIGSERIAL PRIMARY KEY,
+      post_id BIGINT NOT NULL REFERENCES posts_v1(id) ON DELETE CASCADE,
+      idx INT NOT NULL,
+      media_bytes BYTEA NOT NULL,
+      media_mime TEXT NOT NULL DEFAULT ''
+    );
+  `);
+  await pool.query(`ALTER TABLE post_media_v1 ALTER COLUMN media_mime SET DEFAULT ''`);
+  await pool.query(`UPDATE post_media_v1 SET media_mime = '' WHERE media_mime IS NULL`);
+  await pool.query(`ALTER TABLE post_media_v1 ALTER COLUMN media_mime SET NOT NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS post_media_v1_post_idx_unique ON post_media_v1 (post_id, idx)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS post_media_v1_post_idx ON post_media_v1 (post_id)`);
+
+  // Migrate legacy single-media into post_media_v1 if missing
+  await pool.query(`
+    INSERT INTO post_media_v1 (post_id, idx, media_bytes, media_mime)
+    SELECT p.id, 0, p.media_bytes, p.media_mime
+    FROM posts_v1 p
+    WHERE p.media_bytes IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM post_media_v1 pm WHERE pm.post_id = p.id);
+  `);
 
   // Likes
   await pool.query(`
@@ -363,6 +385,19 @@ function safeHandle(username) {
   return u.startsWith("@") ? u : `@${u}`;
 }
 
+function isAllowedMediaMime(m) {
+  const allowed = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+  ]);
+  return allowed.has(String(m || ""));
+}
+
 /* ---------------------------
    Pagination cursor
 ---------------------------- */
@@ -434,7 +469,6 @@ function page(bodyHtml, reqForBase) {
         align-items:center;
         margin:0 0 12px 0;
       }
-      /* Half-size vs previous 320px max */
       .brandLogo{
         max-width:160px;
         width:100%;
@@ -470,6 +504,8 @@ function page(bodyHtml, reqForBase) {
         justify-content:center;
         text-decoration:none;
         background:#fff;
+        font-size:18px;
+        line-height:1;
       }
 
       .collectionsRow{
@@ -497,7 +533,6 @@ function page(bodyHtml, reqForBase) {
       .postList{width:100%;max-width:720px;margin-top:14px}
       .postItem{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:10px;background:#fff}
 
-      /* Post header with author avatar */
       .postHeader{
         display:flex;
         justify-content:space-between;
@@ -511,7 +546,7 @@ function page(bodyHtml, reqForBase) {
         gap:10px;
       }
       .postAuthorAvatar{
-        width:45px;          /* 18px * 2.5 = 45px */
+        width:45px;
         height:45px;
         border-radius:14px;
         object-fit:cover;
@@ -530,27 +565,47 @@ function page(bodyHtml, reqForBase) {
         margin-top:10px;
         background:#fafafa;
       }
+
+      .thumbRow{display:flex;gap:8px;flex-wrap:nowrap;overflow-x:auto;margin-top:10px;padding-bottom:2px}
+      .thumb{
+        width:64px;
+        height:64px;
+        border-radius:12px;
+        border:1px solid #eee;
+        object-fit:cover;
+        background:#fafafa;
+        flex:0 0 auto;
+        cursor:pointer;
+      }
+      .thumbMore{
+        width:64px;height:64px;border-radius:12px;border:1px solid #eee;
+        display:flex;align-items:center;justify-content:center;background:#fff;
+        flex:0 0 auto;
+        font-size:13px;
+      }
+
       .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
       .actionBtn{
         border:1px solid #ddd;
         border-radius:10px;
-        padding:8px 10px;
+        padding:10px 12px;
         background:#fff;
         cursor:pointer;
+        min-height:44px;
+        display:inline-flex;
+        align-items:center;
+        gap:8px;
+        font-size:16px;
+        line-height:1;
       }
       .actionBtn.liked{border-color:#111}
+      .heartGlyph{font-size:18px;line-height:1;display:inline-block}
       .commentBox{margin-top:10px}
 
       .commentItem{border-top:1px solid #f0f0f0;padding-top:8px;margin-top:8px}
-
-      /* Comment layout: avatar left, text block right. Text block aligns under name */
-      .commentRow{
-        display:flex;
-        gap:10px;
-        align-items:flex-start;
-      }
+      .commentRow{display:flex;gap:10px;align-items:flex-start}
       .commentAvatar{
-        width:45px;          /* 18px * 2.5 = 45px */
+        width:45px;
         height:45px;
         border-radius:14px;
         object-fit:cover;
@@ -559,17 +614,101 @@ function page(bodyHtml, reqForBase) {
         flex:0 0 auto;
         margin-top:1px;
       }
-      .commentBody{
-        flex:1;
-        min-width:0;
-      }
+      .commentBody{flex:1;min-width:0}
       .commentAuthor{font-weight:700; line-height:1.1}
       .commentText{white-space:pre-wrap; margin-top:4px}
 
       .divider{height:1px;background:#eee;margin:12px 0}
 
+      /* Collection grid: ALWAYS 2 columns (desktop and mobile) */
+      .mediaGrid2{
+        width:100%;
+        max-width:720px;
+        margin-top:14px;
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap:10px;
+      }
+      .mediaTile{
+        border:1px solid #eee;
+        border-radius:12px;
+        background:#fff;
+        overflow:hidden;
+        position:relative;
+      }
+      .tilePreview{
+        width:100%;
+        aspect-ratio:1/1;
+        object-fit:cover;
+        display:block;
+        background:#fafafa;
+        cursor:pointer;
+      }
+      .tileBadge{
+        position:absolute;
+        top:10px;
+        right:10px;
+        background:rgba(0,0,0,.75);
+        color:#fff;
+        padding:6px 8px;
+        border-radius:999px;
+        font-size:12px;
+        line-height:1;
+      }
+      .tileBar{
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        padding:10px;
+        gap:10px;
+      }
+      .tileMeta{font-size:13px;opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+      /* Fullscreen viewer */
+      .fsOverlay{
+        position:fixed;
+        inset:0;
+        background:rgba(0,0,0,.9);
+        display:none;
+        align-items:center;
+        justify-content:center;
+        z-index:9999;
+        padding:18px;
+      }
+      .fsInner{
+        width:100%;
+        max-width:980px;
+        max-height:90vh;
+        display:flex;
+        flex-direction:column;
+        gap:12px;
+      }
+      .fsCloseRow{display:flex;justify-content:flex-end}
+      .fsClose{
+        border:1px solid rgba(255,255,255,.25);
+        background:rgba(0,0,0,.2);
+        color:#fff;
+        border-radius:10px;
+        padding:10px 12px;
+        cursor:pointer;
+        font-size:14px;
+      }
+      .fsContent{
+        width:100%;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+      }
+      .fsContent img, .fsContent video{
+        max-width:100%;
+        max-height:80vh;
+        border-radius:12px;
+        background:#000;
+      }
+
       @media (max-width: 520px){
         .collectionsRow{grid-template-columns: 1fr}
+        body{margin:16px}
       }
     </style>
   </head>
@@ -584,6 +723,58 @@ function page(bodyHtml, reqForBase) {
     <div class="card">
       ${bodyHtml}
     </div>
+
+    <div class="fsOverlay" id="fsOverlay" role="dialog" aria-modal="true">
+      <div class="fsInner">
+        <div class="fsCloseRow">
+          <button class="fsClose" type="button" id="fsCloseBtn">Close</button>
+        </div>
+        <div class="fsContent" id="fsContent"></div>
+      </div>
+    </div>
+
+    <script>
+      (function(){
+        const overlay = document.getElementById('fsOverlay');
+        const content = document.getElementById('fsContent');
+        const closeBtn = document.getElementById('fsCloseBtn');
+        if (!overlay || !content || !closeBtn) return;
+
+        function close(){
+          overlay.style.display = 'none';
+          content.innerHTML = '';
+        }
+
+        function open(type, src){
+          overlay.style.display = 'flex';
+          if (type === 'video') {
+            content.innerHTML = '<video controls playsinline autoplay src="' + src + '"></video>';
+          } else {
+            content.innerHTML = '<img src="' + src + '" alt="" />';
+          }
+        }
+
+        document.addEventListener('click', function(e){
+          const t = e.target;
+          const el = t && t.closest ? t.closest('[data-fs-src]') : null;
+          if (!el) return;
+          e.preventDefault();
+          const src = el.getAttribute('data-fs-src') || '';
+          const type = el.getAttribute('data-fs-type') || 'image';
+          if (!src) return;
+          open(type, src);
+        });
+
+        closeBtn.addEventListener('click', close);
+        overlay.addEventListener('click', function(e){
+          if (e.target === overlay) close();
+        });
+
+        document.addEventListener('keydown', function(e){
+          if (e.key === 'Escape') close();
+        });
+      })();
+    </script>
   </body>
 </html>`;
 }
@@ -704,7 +895,7 @@ async function updateProfile(customerId, patch) {
   await pool.query(`UPDATE profiles_v2 SET ${sets.join(", ")}, updated_at=NOW() WHERE customer_id=$${i}`, vals);
 }
 
-async function createPost({ shop, customerId, body, mediaBytes, mediaMime }) {
+async function createPost({ shop, customerId, body, mediaFiles }) {
   if (!pool) throw new Error("DB not configured");
   await ensureSchema();
 
@@ -712,16 +903,40 @@ async function createPost({ shop, customerId, body, mediaBytes, mediaMime }) {
     `INSERT INTO posts_v1 (shop, customer_id, body, media_bytes, media_mime)
      VALUES ($1,$2,$3,$4,$5)
      RETURNING id`,
-    [shop, customerId, body || "", mediaBytes || null, mediaMime || ""]
+    [shop, customerId, body || "", null, ""]
   );
-  return r.rows?.[0]?.id || null;
+  const postId = r.rows?.[0]?.id || null;
+  if (!postId) return null;
+
+  if (Array.isArray(mediaFiles) && mediaFiles.length > 0) {
+    for (let i = 0; i < mediaFiles.length; i++) {
+      const f = mediaFiles[i];
+      await pool.query(
+        `INSERT INTO post_media_v1 (post_id, idx, media_bytes, media_mime)
+         VALUES ($1,$2,$3,$4)`,
+        [postId, i, f.buffer, f.mimetype || ""]
+      );
+    }
+  }
+
+  return postId;
 }
 
-async function getPostMedia(postId) {
+async function getPostMediaByIndex(postId, idx) {
   if (!pool) return null;
   await ensureSchema();
-  const r = await pool.query(`SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`, [postId]);
-  return r.rows?.[0] || null;
+
+  const r = await pool.query(
+    `SELECT media_bytes, media_mime
+     FROM post_media_v1
+     WHERE post_id=$1 AND idx=$2`,
+    [postId, idx]
+  );
+  if (r.rows?.[0]) return r.rows[0];
+
+  // Fallback legacy
+  const legacy = await pool.query(`SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`, [postId]);
+  return legacy.rows?.[0] || null;
 }
 
 async function listPostsForCustomerWithMeta({ targetCustomerId, viewerCustomerId, limit = 20 }) {
@@ -731,8 +946,10 @@ async function listPostsForCustomerWithMeta({ targetCustomerId, viewerCustomerId
   const r = await pool.query(
     `
     SELECT
-      p.id, p.shop, p.customer_id, p.body, p.media_mime, p.created_at,
-      pr.first_name, pr.last_name, pr.username
+      p.id, p.shop, p.customer_id, p.body, p.created_at,
+      pr.first_name, pr.last_name, pr.username,
+      COALESCE((SELECT COUNT(*)::int FROM post_media_v1 pm WHERE pm.post_id = p.id), 0) AS media_count,
+      (SELECT pm.media_mime FROM post_media_v1 pm WHERE pm.post_id = p.id ORDER BY pm.idx ASC LIMIT 1) AS media_mime_first
     FROM posts_v1 p
     LEFT JOIN profiles_v2 pr ON pr.customer_id = p.customer_id
     WHERE p.customer_id = $1
@@ -767,8 +984,10 @@ async function listFeedPostsWithMeta({ shop, viewerCustomerId, limit = 20, curso
   const r = await pool.query(
     `
     SELECT
-      p.id, p.shop, p.customer_id, p.body, p.media_mime, p.created_at,
-      pr.first_name, pr.last_name, pr.username
+      p.id, p.shop, p.customer_id, p.body, p.created_at,
+      pr.first_name, pr.last_name, pr.username,
+      COALESCE((SELECT COUNT(*)::int FROM post_media_v1 pm WHERE pm.post_id = p.id), 0) AS media_count,
+      (SELECT pm.media_mime FROM post_media_v1 pm WHERE pm.post_id = p.id ORDER BY pm.idx ASC LIMIT 1) AS media_mime_first
     FROM posts_v1 p
     LEFT JOIN profiles_v2 pr ON pr.customer_id = p.customer_id
     WHERE p.shop = $1${cursorClause}
@@ -832,7 +1051,7 @@ async function getPostsMeta(postIds, viewerCustomerId) {
     if (byPostId[row.post_id]) byPostId[row.post_id].comment_count = Number(row.cnt) || 0;
   }
 
-  // Preview last 2 comments (author + body)
+  // Preview last 2 comments
   const cR = await pool.query(
     `
     SELECT * FROM (
@@ -900,9 +1119,11 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
   const when = new Date(post.created_at).toLocaleString();
 
   const body = escapeHtml(post.body || "");
-  const hasMedia = !!(post.media_mime && String(post.media_mime).trim());
-  const isVideo = hasMedia && String(post.media_mime).startsWith("video/");
-  const mediaUrl = `${base}/posts/${id}/media`;
+  const mediaCount = Number(post.media_count || 0);
+  const firstMime = String(post.media_mime_first || "").trim();
+  const hasMedia = mediaCount > 0 && !!firstMime;
+  const isVideo = hasMedia && firstMime.startsWith("video/");
+  const mediaUrl0 = `${base}/posts/${id}/media?i=0`;
 
   const authorHref = `${base}/u/${encodeURIComponent(post.customer_id)}`;
   const authorAvatar = `${base}/avatar/${encodeURIComponent(post.customer_id || "")}`;
@@ -916,8 +1137,23 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
   const mediaHtml = !hasMedia
     ? ""
     : isVideo
-      ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
-      : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
+      ? `<video class="media" controls playsinline data-fs-src="${escapeHtml(mediaUrl0)}" data-fs-type="video" src="${escapeHtml(mediaUrl0)}"></video>`
+      : `<img class="media" src="${escapeHtml(mediaUrl0)}" alt="Post media" data-fs-src="${escapeHtml(mediaUrl0)}" data-fs-type="image" />`;
+
+  // Thumbnails for multi-image posts (only if first is image)
+  let thumbsHtml = "";
+  if (hasMedia && !isVideo && mediaCount > 1) {
+    const maxThumbs = Math.min(4, mediaCount);
+    const thumbs = [];
+    for (let i = 0; i < maxThumbs; i++) {
+      const u = `${base}/posts/${id}/media?i=${i}`;
+      thumbs.push(`<img class="thumb" src="${escapeHtml(u)}" alt="" data-fs-src="${escapeHtml(u)}" data-fs-type="image" />`);
+    }
+    if (mediaCount > maxThumbs) {
+      thumbs.push(`<div class="thumbMore">+${mediaCount - maxThumbs}</div>`);
+    }
+    thumbsHtml = `<div class="thumbRow">${thumbs.join("")}</div>`;
+  }
 
   const likeCount = Number(post.like_count || 0);
   const commentCount = Number(post.comment_count || 0);
@@ -950,6 +1186,8 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
           })
           .join("");
 
+  const heart = liked ? "♥" : "♡";
+
   return `
     <div class="postItem" id="post-${id}">
       <div class="postHeader">
@@ -966,12 +1204,14 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
 
       ${body ? `<p style="margin:10px 0 0 0;white-space:pre-wrap">${body}</p>` : ""}
       ${mediaHtml}
+      ${thumbsHtml}
 
       <div class="actions">
         <form method="POST" action="${likeAction}" style="margin:0">
           ${returnInput}
-          <button class="actionBtn ${liked ? "liked" : ""}" type="submit">
-            ${liked ? "Liked" : "Like"} (${likeCount})
+          <button class="actionBtn ${liked ? "liked" : ""}" type="submit" aria-label="Like">
+            <span class="heartGlyph">${heart}</span>
+            <span>${likeCount}</span>
           </button>
         </form>
 
@@ -985,6 +1225,48 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
           <input name="comment" maxlength="300" placeholder="Write a comment..." />
           <button class="btn" type="submit" style="margin-top:10px">Comment</button>
         </form>
+      </div>
+    </div>
+  `;
+}
+
+/* ---------------------------
+   Collection media tile renderer
+---------------------------- */
+
+function renderCollectionTile({ post, base }) {
+  const id = Number(post.id);
+  const mediaCount = Number(post.media_count || 0);
+  const firstMime = String(post.media_mime_first || "").trim();
+  const hasMedia = mediaCount > 0 && !!firstMime;
+  if (!hasMedia) return "";
+
+  const isVideo = firstMime.startsWith("video/");
+  const src0 = `${base}/posts/${id}/media?i=0`;
+
+  const liked = !!post.viewer_liked;
+  const heart = liked ? "♥" : "♡";
+  const likeCount = Number(post.like_count || 0);
+  const commentCount = Number(post.comment_count || 0);
+
+  const badge = mediaCount > 1 ? `<div class="tileBadge">+${mediaCount - 1}</div>` : "";
+  const preview = isVideo
+    ? `<video class="tilePreview" muted playsinline controls data-fs-src="${escapeHtml(src0)}" data-fs-type="video" src="${escapeHtml(src0)}"></video>`
+    : `<img class="tilePreview" src="${escapeHtml(src0)}" alt="" data-fs-src="${escapeHtml(src0)}" data-fs-type="image" />`;
+
+  return `
+    <div class="mediaTile">
+      ${badge}
+      ${preview}
+      <div class="tileBar">
+        <form method="POST" action="${base}/posts/${id}/like" style="margin:0">
+          <input type="hidden" name="return" value="${escapeHtml(base + "/collection")}" />
+          <button class="actionBtn ${liked ? "liked" : ""}" type="submit" aria-label="Like">
+            <span class="heartGlyph">${heart}</span>
+            <span>${likeCount}</span>
+          </button>
+        </form>
+        <div class="tileMeta">💬 ${commentCount}</div>
       </div>
     </div>
   `;
@@ -1035,7 +1317,7 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
-/** Avatar for any user (used in comments + post headers, requires login) */
+/** Avatar for any user (requires login) */
 proxy.get("/avatar/:customerId", async (req, res) => {
   const viewerId = getViewerCustomerId(req);
   if (!viewerId) return res.status(200).type("text").send("Not logged in");
@@ -1063,7 +1345,7 @@ proxy.get("/avatar/:customerId", async (req, res) => {
   }
 });
 
-/** Post media */
+/** Post media: supports multiple items via ?i=0..n (defaults to 0) */
 proxy.get("/posts/:id/media", async (req, res) => {
   const customerId = getViewerCustomerId(req);
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -1072,8 +1354,11 @@ proxy.get("/posts/:id/media", async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(404).type("text").send("Not found");
 
+  const idxRaw = typeof req.query.i === "string" ? req.query.i : "0";
+  const idx = Math.max(0, Math.min(50, Number(idxRaw) || 0));
+
   try {
-    const m = await getPostMedia(id);
+    const m = await getPostMediaByIndex(id, idx);
     if (!m?.media_bytes || !m?.media_mime) return res.status(404).type("text").send("Not found");
 
     res.setHeader("Content-Type", m.media_mime);
@@ -1178,7 +1463,7 @@ proxy.get("/", async (req, res) => {
               <a class="composerFake" href="${newPostHref}">Share something...</a>
               <a class="iconBtn" href="${newPostHref}" aria-label="Add photo or video">＋</a>
             </div>
-            <div class="muted small help">500 characters max. Media optional.</div>
+            <div class="muted small help">500 characters max. Media optional. Multi-upload supported.</div>
           </div>
 
           ${postsHtml}
@@ -1323,7 +1608,7 @@ proxy.get("/me", async (req, res) => {
                 <a class="composerFake" href="${newPostHref}">Share something...</a>
                 <a class="iconBtn" href="${newPostHref}" aria-label="Add photo or video">＋</a>
               </div>
-              <div class="muted small help">500 characters max. Media optional.</div>
+              <div class="muted small help">500 characters max. Media optional. Multi-upload supported.</div>
             </div>
 
             <div class="collectionsRow">
@@ -1346,6 +1631,58 @@ proxy.get("/me", async (req, res) => {
 
             ${postsHtml}
           </div>
+        </div>
+      `,
+      req
+    )
+  );
+});
+
+/** Collection page (start) */
+proxy.get("/collection", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) {
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+  }
+  if (!pool) {
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+  }
+
+  await ensureRow(viewerId, shop);
+
+  // Composer requires media on this page
+  const newPostHref = `${base}/post/new?return=collection&require_media=1`;
+
+  const { posts } = await listPostsForCustomerWithMeta({
+    targetCustomerId: viewerId,
+    viewerCustomerId: viewerId,
+    limit: 50,
+  });
+
+  // Only show tiles that have media
+  const tiles = posts.map((p) => renderCollectionTile({ post: p, base })).filter(Boolean);
+
+  const gridHtml =
+    tiles.length === 0
+      ? `<div class="postList"><p class="muted">No media posts yet.</p></div>`
+      : `<div class="mediaGrid2">${tiles.join("")}</div>`;
+
+  return res.type("html").send(
+    page(
+      `
+        <div class="stack">
+          <div class="composer">
+            <div class="composerTop">
+              <a class="composerFake" href="${newPostHref}">Add to your collection...</a>
+              <a class="iconBtn" href="${newPostHref}" aria-label="Add media">＋</a>
+            </div>
+            <div class="muted small help">Media required on this page. Multi-upload supported.</div>
+          </div>
+
+          ${gridHtml}
         </div>
       `,
       req
@@ -1390,15 +1727,17 @@ proxy.get("/u/:customerId", async (req, res) => {
     posts.length === 0
       ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
       : `<div class="postList">
-          ${posts.map((p) =>
-            renderPostCard({
-              post: p,
-              base,
-              viewerId,
-              showAuthorLink: false,
-              returnPath: `${base}/u/${encodeURIComponent(targetId)}`,
-            })
-          ).join("")}
+          ${posts
+            .map((p) =>
+              renderPostCard({
+                post: p,
+                base,
+                viewerId,
+                showAuthorLink: false,
+                returnPath: `${base}/u/${encodeURIComponent(targetId)}`,
+              })
+            )
+            .join("")}
         </div>`;
 
   return res.type("html").send(
@@ -1422,7 +1761,7 @@ proxy.get("/u/:customerId", async (req, res) => {
   );
 });
 
-/** New post page */
+/** New post page (supports multi-upload) */
 proxy.get("/post/new", async (req, res) => {
   const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
@@ -1435,14 +1774,19 @@ proxy.get("/post/new", async (req, res) => {
   }
 
   const r = typeof req.query.return === "string" ? req.query.return : "feed";
-  const returnTo = r === "me" ? `${base}/me` : r === "feed" ? `${base}` : r.startsWith("/") ? r : `${base}`;
+  const returnTo =
+    r === "me" ? `${base}/me` : r === "feed" ? `${base}` : r === "collection" ? `${base}/collection` : r.startsWith("/") ? r : `${base}`;
+
+  const requireMedia = typeof req.query.require_media === "string" && req.query.require_media === "1";
 
   const status =
     req.query.err === "1"
-      ? `<p class="error">Add text or media.</p>`
+      ? `<p class="error">${requireMedia ? "Add at least one media file." : "Add text or media."}</p>`
       : req.query.type === "1"
         ? `<p class="error">Unsupported file type.</p>`
-        : "";
+        : req.query.size === "1"
+          ? `<p class="error">File too large.</p>`
+          : "";
 
   const postAction = `${base}/post/new`;
   const cancelHref = returnTo;
@@ -1454,20 +1798,22 @@ proxy.get("/post/new", async (req, res) => {
         <div class="stack">
           <form method="POST" enctype="multipart/form-data" action="${postAction}">
             <input type="hidden" name="return" value="${escapeHtml(returnTo)}" />
+            <input type="hidden" name="require_media" value="${requireMedia ? "1" : "0"}" />
 
             <label for="body">Post</label>
             <textarea id="body" name="body" maxlength="500" placeholder="Write your post (max 500 characters)"></textarea>
             <div class="muted small help">0 to 500 characters.</div>
 
             <label for="media">Photo or video</label>
-            <input id="media" type="file" name="media" accept="image/*,video/*" />
+            <input id="media" type="file" name="media" accept="image/*,video/*" multiple />
 
             <div class="row">
               <button class="btn" type="submit" id="sendBtn">Send</button>
               <a class="btn" href="${cancelHref}">Cancel</a>
             </div>
 
-            <div class="muted small help">Media max 15MB.</div>
+            <div class="muted small help">Up to 6 files. Max 15MB each.</div>
+            ${requireMedia ? `<div class="muted small help"><b>Media required for Collection posts.</b></div>` : ""}
           </form>
         </div>
 
@@ -1476,10 +1822,11 @@ proxy.get("/post/new", async (req, res) => {
             const ta = document.getElementById('body');
             const media = document.getElementById('media');
             const btn = document.getElementById('sendBtn');
+            const requireMedia = ${requireMedia ? "true" : "false"};
             function update(){
               const hasText = ta && ta.value && ta.value.trim().length > 0;
               const hasMedia = media && media.files && media.files.length > 0;
-              const ok = hasText || hasMedia;
+              const ok = requireMedia ? hasMedia : (hasText || hasMedia);
               btn.disabled = !ok;
               btn.style.opacity = btn.disabled ? '0.5' : '1';
               btn.style.cursor = btn.disabled ? 'not-allowed' : 'pointer';
@@ -1495,8 +1842,8 @@ proxy.get("/post/new", async (req, res) => {
   );
 });
 
-/** Create post */
-proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
+/** Create post (multi-upload) */
+proxy.post("/post/new", uploadPostMedia.array("media", 6), async (req, res) => {
   const shop = getShop(req);
   const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
@@ -1505,40 +1852,37 @@ proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const body = cleanMultiline(req.body?.body, 500);
+  const requireMedia = String(req.body?.require_media || "0") === "1";
 
-  const file = req.file;
-  let mediaBytes = null;
-  let mediaMime = "";
+  const files = Array.isArray(req.files) ? req.files : [];
+  const mediaFiles = [];
 
-  if (file && file.buffer && file.mimetype) {
-    const allowed = new Set([
-      "image/png",
-      "image/jpeg",
-      "image/webp",
-      "image/gif",
-      "video/mp4",
-      "video/webm",
-      "video/quicktime",
-    ]);
-    if (!allowed.has(file.mimetype)) return res.redirect(`${base}/post/new?type=1`);
-    mediaBytes = file.buffer;
-    mediaMime = file.mimetype;
+  for (const f of files) {
+    if (!f || !f.buffer || !f.mimetype) continue;
+    if (!isAllowedMediaMime(f.mimetype)) return res.redirect(`${base}/post/new?type=1&return=${encodeURIComponent(req.body?.return || "")}${requireMedia ? "&require_media=1" : ""}`);
+    mediaFiles.push({ buffer: f.buffer, mimetype: f.mimetype });
   }
 
   const hasText = !!(body && body.trim());
-  const hasMedia = !!mediaBytes;
-  if (!hasText && !hasMedia) return res.redirect(`${base}/post/new?err=1`);
+  const hasMedia = mediaFiles.length > 0;
+
+  if (requireMedia && !hasMedia) {
+    return res.redirect(`${base}/post/new?err=1&return=${encodeURIComponent(req.body?.return || "")}&require_media=1`);
+  }
+  if (!requireMedia && !hasText && !hasMedia) {
+    return res.redirect(`${base}/post/new?err=1&return=${encodeURIComponent(req.body?.return || "")}`);
+  }
 
   const returnToRaw = cleanText(req.body?.return, 300);
   const returnTo = returnToRaw && returnToRaw.startsWith("/") ? returnToRaw : `${base}`;
 
   try {
     await ensureRow(viewerId, shop);
-    await createPost({ shop, customerId: viewerId, body, mediaBytes, mediaMime });
+    await createPost({ shop, customerId: viewerId, body, mediaFiles });
     return res.redirect(returnTo);
   } catch (e) {
     console.error("create post error:", e);
-    return res.redirect(`${base}/post/new?err=1`);
+    return res.redirect(`${base}/post/new?err=1&return=${encodeURIComponent(req.body?.return || "")}${requireMedia ? "&require_media=1" : ""}`);
   }
 });
 
@@ -1676,7 +2020,6 @@ proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
   }
 });
 
-proxy.get("/collection", (req, res) => res.type("html").send(page(`<p>Collection placeholder.</p>`, req)));
 proxy.get("/trades", (req, res) => res.type("html").send(page(`<p>Trades placeholder.</p>`, req)));
 
 app.use("/proxy", proxy);
