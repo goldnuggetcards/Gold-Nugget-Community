@@ -25,7 +25,6 @@ const pool = DATABASE_URL
 
 async function ensureSchema() {
   if (!pool) return;
-  // v2: key by customer_id only so shop changes do not “lose” data
   await pool.query(`
     CREATE TABLE IF NOT EXISTS profiles_v2 (
       customer_id TEXT PRIMARY KEY,
@@ -161,7 +160,8 @@ function signedQueryString(req) {
   return new URLSearchParams(req.query).toString();
 }
 
-async function renderProfile(req, res, { saved = false, invalid = false, dbError = false } = {}) {
+/** Profile overview (no username form here) */
+proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
@@ -173,69 +173,104 @@ async function renderProfile(req, res, { saved = false, invalid = false, dbError
   }
 
   const username = await getUsername(customerId);
-
-  const dbWarning = pool
-    ? ""
-    : `<p class="error">DATABASE_URL not set. Create Render Postgres and add DATABASE_URL to the web service.</p>`;
-
-  const status = dbError
-    ? `<p class="error">Could not save. Check Render logs for Postgres error.</p>`
-    : saved
-      ? `<p class="ok">Saved.</p>`
-      : invalid
-        ? `<p class="error">Invalid username.</p>`
-        : "";
-
   const qs = signedQueryString(req);
 
-  return res.type("html").send(
+  const status =
+    req.query.saved === "1"
+      ? `<p class="ok">Saved.</p>`
+      : req.query.err === "1"
+        ? `<p class="error">Invalid username.</p>`
+        : req.query.dberr === "1"
+          ? `<p class="error">Could not save. Check Render logs for Postgres error.</p>`
+          : "";
+
+  res.type("html").send(
     page(
       "My Profile",
       `
         ${status}
-        ${dbWarning}
 
         <div class="grid">
           <div class="k">Customer ID</div><div><code>${customerId}</code></div>
           <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
         </div>
 
-        <form method="GET" action="/apps/nuggetdepot/me/username?${qs}">
-          <label for="username">Set username</label>
-          <input id="username" name="username" placeholder="ex: nuggetking" value="${username || ""}" />
-          <div class="muted">3–20 characters. Letters, numbers, underscore, dash, dot.</div>
-          <button class="btn" type="submit">Save</button>
-        </form>
+        <a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Edit username</a>
       `,
       shop
     )
   );
-}
-
-proxy.get("/me", async (req, res) => {
-  return renderProfile(req, res);
 });
 
+/** Username edit page (form lives here) */
 proxy.get("/me/username", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
   if (!customerId) {
-    return res.status(401).type("html").send(page("My Profile", `<p>You are not logged in.</p>`, shop));
+    return res.status(401).type("html").send(page("Edit Username", `<p>You are not logged in.</p>`, shop));
   }
 
+  const username = await getUsername(customerId);
+  const qs = signedQueryString(req);
+
+  res.type("html").send(
+    page(
+      "Edit Username",
+      `
+        <p class="muted">3–20 characters. Letters, numbers, underscore, dash, dot.</p>
+
+        <form method="GET" action="/apps/nuggetdepot/me/username/save?${qs}">
+          <label for="username">Username</label>
+          <input id="username" name="username" placeholder="ex: nuggetking" value="${username || ""}" />
+          <button class="btn" type="submit">Save</button>
+          <a class="btn" style="margin-left:8px" href="/apps/nuggetdepot/me?${qs}">Back</a>
+        </form>
+      `,
+      shop
+    )
+  );
+});
+
+/** Save username (GET because App Proxy often does not forward POST) */
+proxy.get("/me/username/save", async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+
+  if (!customerId) {
+    return res.status(401).type("html").send(page("Edit Username", `<p>You are not logged in.</p>`, shop));
+  }
+
+  const qs = signedQueryString(req);
   const username = cleanUsername(req.query.username);
+
   if (!username) {
-    return renderProfile(req, res, { invalid: true });
+    // no redirects (unsigned), render a signed back link
+    return res.type("html").send(
+      page(
+        "Edit Username",
+        `<p class="error">Invalid username.</p><a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Back</a>`,
+        shop
+      )
+    );
   }
 
   try {
     await setUsername(customerId, shop, username);
-    return renderProfile(req, res, { saved: true });
+    return res
+      .type("html")
+      .send(page("Edit Username", `<p class="ok">Saved.</p><a class="btn" href="/apps/nuggetdepot/me?saved=1&${qs}">Back to profile</a>`, shop));
   } catch (e) {
     console.error("setUsername error:", e);
-    return renderProfile(req, res, { dbError: true });
+    return res.type("html").send(
+      page(
+        "Edit Username",
+        `<p class="error">Could not save. Check Render logs for Postgres error.</p><a class="btn" href="/apps/nuggetdepot/me?dberr=1&${qs}">Back</a>`,
+        shop
+      )
+    );
   }
 });
 
