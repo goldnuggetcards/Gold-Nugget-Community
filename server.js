@@ -80,7 +80,6 @@ proxy.get("/", (req, res) => {
     <li><a href="/apps/nuggetdepot/me">My Profile</a></li>
     <li><a href="/apps/nuggetdepot/collection">My Collection</a></li>
     <li><a href="/apps/nuggetdepot/trades">Trades</a></li>
-
     </ul>
   `);
 });
