@@ -53,6 +53,18 @@ function requireProxyAuth(req, res, next) {
   return next();
 }
 
+// Root page (so your Render URL doesn't show "Not found")
+app.get("/", (req, res) => {
+  res.type("html").send(`
+    <h1>Nugget Depot</h1>
+    <p>Server is live.</p>
+    <ul>
+      <li><a href="/healthz">Health Check</a></li>
+      <li>Shopify App Proxy entry: <code>/proxy</code> (requires signed request)</li>
+    </ul>
+  `);
+});
+
 // Health check for Render
 app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 
