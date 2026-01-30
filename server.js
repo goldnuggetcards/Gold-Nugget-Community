@@ -1,13 +1,9 @@
 // server.js (FULL FILE REPLACEMENT)
-// Adds posting MVP:
-// - Post entry point visible ONLY on /me (your own profile)
-// - Clicking the box or media button goes to /post/new (more space)
-// - 500 character max
-// - Optional media (photo or video)
-// - Send creates post and redirects back to /me
-// - Public profile route /u/:customerId does NOT show the post box
-// Fix included:
-// - Send button enables when EITHER text OR media is selected
+// Change added:
+// - On /me (My Profile), add two clickable "media collections" cards between the composer and the timeline:
+//   1) Collection -> /collection
+//   2) Trades -> /trades
+// (Uses Shopify path_prefix via basePathFromReq)
 
 import express from "express";
 import crypto from "crypto";
@@ -230,6 +226,29 @@ function page(bodyHtml, shop, reqForBase) {
         background:#fff;
       }
 
+      /* NEW: media collections row */
+      .collectionsRow{
+        width:100%;
+        max-width:720px;
+        margin-top:12px;
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap:10px;
+      }
+      .collectionCard{
+        border:1px solid #eee;
+        border-radius:12px;
+        padding:14px;
+        text-decoration:none;
+        background:#fff;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+      }
+      .collectionTitle{font-weight:800}
+      .chev{opacity:.65}
+
       .postList{width:100%;max-width:720px;margin-top:14px}
       .postItem{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:10px}
       .postMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
@@ -240,6 +259,10 @@ function page(bodyHtml, shop, reqForBase) {
         border:1px solid #eee;
         margin-top:10px;
         background:#fafafa;
+      }
+
+      @media (max-width: 520px){
+        .collectionsRow{grid-template-columns: 1fr}
       }
     </style>
   </head>
@@ -538,6 +561,9 @@ proxy.get("/me", async (req, res) => {
   const editHref = `${base}/me/edit`;
   const newPostHref = `${base}/post/new`;
 
+  const collectionHref = `${base}/collection`;
+  const tradesHref = `${base}/trades`;
+
   const posts = await listPostsForCustomer(customerId, 20);
 
   const postsHtml =
@@ -593,6 +619,25 @@ proxy.get("/me", async (req, res) => {
               <div class="muted small help">500 characters max. Media optional.</div>
             </div>
 
+            <!-- NEW: media collections (between composer and timeline) -->
+            <div class="collectionsRow">
+              <a class="collectionCard" href="${collectionHref}" aria-label="Go to Collection">
+                <div>
+                  <div class="collectionTitle">Collection</div>
+                  <div class="muted small">View your saved cards</div>
+                </div>
+                <div class="chev">›</div>
+              </a>
+
+              <a class="collectionCard" href="${tradesHref}" aria-label="Go to Trades">
+                <div>
+                  <div class="collectionTitle">Trades</div>
+                  <div class="muted small">Offers and listings</div>
+                </div>
+                <div class="chev">›</div>
+              </a>
+            </div>
+
             ${postsHtml}
           </div>
         </div>
@@ -640,7 +685,6 @@ proxy.get("/u/:customerId", async (req, res) => {
     ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
     : `<div class="muted handleUnder">Username not set</div>`;
 
-  // Avatar endpoint currently only supports "me", so use initials fallback for public view for now.
   const ini = initialsFor(profile?.first_name || "", profile?.last_name || "");
   const avatarSvg = svgAvatar(ini);
 
@@ -831,7 +875,7 @@ proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
   }
 });
 
-/** Edit profile (existing) */
+/** Edit profile */
 proxy.get("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
