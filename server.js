@@ -4,8 +4,8 @@ import crypto from "crypto";
 const app = express();
 app.disable("x-powered-by");
 
-const { SHOPIFY_API_SECRET } = process.env;
-const PORT = Number(process.env.PORT) || 3000;
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || "";
+const PORT = parseInt(process.env.PORT || "", 10) || 3000;
 
 function buildProxyMessage(query) {
   return Object.keys(query)
@@ -22,8 +22,10 @@ function verifyShopifyProxy(req) {
   if (!SHOPIFY_API_SECRET) return false;
 
   const query = { ...req.query };
+
   const signature = typeof query.signature === "string" ? query.signature : "";
   if (!signature) return false;
+
   delete query.signature;
 
   const message = buildProxyMessage(query);
@@ -35,16 +37,17 @@ function verifyShopifyProxy(req) {
 
   const a = Buffer.from(digest, "utf8");
   const b = Buffer.from(signature, "utf8");
+
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 function requireProxyAuth(req, res, next) {
   if (!SHOPIFY_API_SECRET) return res.status(500).type("text").send("Missing SHOPIFY_API_SECRET");
   if (!verifyShopifyProxy(req)) return res.status(401).type("text").send("Invalid proxy signature");
-  next();
+  return next();
 }
 
-// Health check for Render (and quick sanity test)
+// Health check for Render
 app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 
 const proxy = express.Router();
@@ -74,12 +77,13 @@ proxy.get("/trades", (req, res) => {
   res.type("html").send("<h1>Trades</h1><p>Placeholder</p>");
 });
 
-// Mount router so your proxy URL can be set to https://YOUR_SERVER/proxy
+// App Proxy URL should be set to https://YOUR_SERVER_DOMAIN/proxy
 app.use("/proxy", proxy);
 
-// Optional: nicer 404 for anything else
+// Nicer 404
 app.use((req, res) => res.status(404).type("text").send("Not found"));
 
+// Render requires binding to the provided PORT on 0.0.0.0
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on ${PORT}`);
+  console.log(`Server listening on http://0.0.0.0:${PORT}`);
 });
