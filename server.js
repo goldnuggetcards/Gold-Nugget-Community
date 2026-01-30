@@ -1,8 +1,11 @@
 import express from "express";
 import crypto from "crypto";
+import { Pool } from "pg";
 
 const app = express();
 app.disable("x-powered-by");
+
+app.use(express.urlencoded({ extended: false }));
 
 // Basic request logging (useful on Render)
 app.use((req, res, next) => {
@@ -12,6 +15,22 @@ app.use((req, res, next) => {
 
 const SHOPIFY_API_SECRET = (process.env.SHOPIFY_API_SECRET || "").trim();
 const PORT = Number(process.env.PORT) || 3000;
+
+const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
+
+async function ensureSchema() {
+  if (!pool) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS profiles (
+      shop TEXT NOT NULL,
+      customer_id TEXT NOT NULL,
+      username TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (shop, customer_id)
+    );
+  `);
+}
 
 function buildProxyMessage(query) {
   return Object.keys(query)
@@ -34,12 +53,10 @@ function verifyShopifyProxy(req) {
   delete query.signature;
 
   const message = buildProxyMessage(query);
-
   const digest = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(message).digest("hex");
 
   const a = Buffer.from(digest, "utf8");
   const b = Buffer.from(signature, "utf8");
-
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
@@ -67,6 +84,10 @@ function page(title, bodyHtml, shop) {
       .grid{display:grid;grid-template-columns:180px 1fr;gap:8px 16px;margin-top:12px}
       .k{opacity:.75}
       .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none}
+      input{padding:10px 12px;border:1px solid #ddd;border-radius:10px;width:280px;max-width:100%}
+      label{display:block;margin-top:12px;margin-bottom:6px}
+      .error{color:#b00020}
+      .ok{color:#137333}
     </style>
   </head>
   <body>
@@ -107,41 +128,109 @@ proxy.use(requireProxyAuth);
 
 proxy.get("/", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res
-    .type("html")
-    .send(page("Nugget Depot", `<p>Proxy working.</p><p>Use the navigation above.</p>`, shop));
+  res.type("html").send(page("Nugget Depot", `<p>Proxy working.</p><p>Use the navigation above.</p>`, shop));
 });
 
-// My Profile (functional without Admin API: shows login state + lets you set a username later)
-proxy.get("/me", (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const loggedInCustomerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+async function getUsername(shop, customerId) {
+  if (!pool) return "";
+  await ensureSchema();
+  const r = await pool.query(
+    "SELECT username FROM profiles WHERE shop=$1 AND customer_id=$2",
+    [shop, customerId]
+  );
+  return r.rows?.[0]?.username || "";
+}
 
-  if (!loggedInCustomerId) {
+async function setUsername(shop, customerId, username) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
+  await pool.query(
+    `INSERT INTO profiles (shop, customer_id, username)
+     VALUES ($1,$2,$3)
+     ON CONFLICT (shop, customer_id)
+     DO UPDATE SET username=EXCLUDED.username, updated_at=NOW()`,
+    [shop, customerId, username]
+  );
+}
+
+function cleanUsername(input) {
+  const u = String(input || "").trim();
+  // Allow letters, numbers, underscore, dash, dot. 3-20 chars.
+  if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(u)) return "";
+  return u;
+}
+
+// My Profile: shows login state + lets you set username
+proxy.get("/me", async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const saved = req.query.saved === "1";
+
+  if (!customerId) {
     return res
       .type("html")
       .send(page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
   }
 
+  const username = await getUsername(shop, customerId);
+  const status = saved ? `<p class="ok">Saved.</p>` : "";
+
+  const dbNote = pool
+    ? ""
+    : `<p class="error">DATABASE_URL not set. Create Render Postgres and add DATABASE_URL.</p>`;
+
   return res.type("html").send(
     page(
       "My Profile",
       `
-        <p>Logged in.</p>
+        ${status}
+        ${dbNote}
         <div class="grid">
-          <div class="k">Customer ID</div><div><code>${loggedInCustomerId}</code></div>
+          <div class="k">Customer ID</div><div><code>${customerId}</code></div>
+          <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
         </div>
-        <h2 style="margin-top:18px">Next</h2>
-        <ul>
-          <li>Save a username (stored in our DB keyed to your customer ID)</li>
-          <li>Show your collection count</li>
-          <li>Show your trade listings</li>
-        </ul>
+
+        <form method="POST" action="/proxy/me/username?shop=${encodeURIComponent(shop)}&logged_in_customer_id=${encodeURIComponent(customerId)}">
+          <label for="username">Set username</label>
+          <input id="username" name="username" placeholder="ex: nuggetking" value="${username || ""}" />
+          <div class="muted">3–20 characters. Letters, numbers, underscore, dash, dot.</div>
+          <button class="btn" type="submit">Save</button>
+        </form>
       `,
       shop
     )
   );
+});
+
+// Save username
+proxy.post("/me/username", async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+
+  if (!customerId) {
+    return res.status(401).type("html").send(page("My Profile", `<p>You are not logged in.</p>`, shop));
+  }
+
+  const username = cleanUsername(req.body?.username);
+  if (!username) {
+    return res
+      .status(400)
+      .type("html")
+      .send(page("My Profile", `<p class="error">Invalid username. Use 3–20 characters: letters, numbers, _ . -</p><a class="btn" href="/apps/nuggetdepot/me">Back</a>`, shop));
+  }
+
+  try {
+    await setUsername(shop, customerId, username);
+    return res.redirect(`/apps/nuggetdepot/me?saved=1`);
+  } catch (e) {
+    console.error(e);
+    return res
+      .status(500)
+      .type("html")
+      .send(page("My Profile", `<p class="error">Could not save username. Check DATABASE_URL.</p>`, shop));
+  }
 });
 
 proxy.get("/collection", (req, res) => {
@@ -159,12 +248,10 @@ app.use("/proxy", proxy);
 // 404 fallback
 app.use((req, res) => res.status(404).type("text").send("Not found"));
 
-// Ensure Render sees a bound port
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on 0.0.0.0:${PORT}`);
 });
 
-// Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("SIGTERM received, shutting down...");
   server.close(() => process.exit(0));
