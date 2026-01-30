@@ -1,6 +1,17 @@
 // server.js (FULL FILE REPLACEMENT)
-// Change:
-// - Remove the "Shop: <code>...</code>" footer from all pages (hidden).
+// Fixes navigation without carrying Shopify signed querystring by using a signed cookie session.
+//
+// What this does:
+// - First request from Shopify App Proxy is verified with signature
+// - On success, server sets an HMAC-signed cookie containing shop, customer_id, path_prefix
+// - Subsequent clicks use clean URLs without signature and still pass auth via cookie
+//
+// Keeps your current features:
+// - /me and /me/edit navigation
+// - Posting MVP (/post/new), 500 chars max, optional media, redirects back to /me
+// - Public profile /u/:customerId does NOT show composer
+// - Collection + Trades cards under composer on /me
+// - Removes shop footer from all pages
 
 import express from "express";
 import crypto from "crypto";
@@ -9,7 +20,6 @@ import multer from "multer";
 
 const app = express();
 app.disable("x-powered-by");
-
 app.use(express.urlencoded({ extended: false }));
 
 app.use((req, res, next) => {
@@ -110,10 +120,8 @@ async function ensureSchema() {
 
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET DEFAULT ''`);
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET DEFAULT ''`);
-
   await pool.query(`UPDATE posts_v1 SET body = '' WHERE body IS NULL`);
   await pool.query(`UPDATE posts_v1 SET media_mime = '' WHERE media_mime IS NULL`);
-
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET NOT NULL`);
   await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET NOT NULL`);
 
@@ -121,6 +129,10 @@ async function ensureSchema() {
     `CREATE INDEX IF NOT EXISTS posts_v1_customer_created_idx ON posts_v1 (customer_id, created_at DESC)`
   );
 }
+
+/* ---------------------------
+   Shopify proxy verification
+---------------------------- */
 
 function buildProxyMessage(query) {
   return Object.keys(query)
@@ -150,9 +162,138 @@ function verifyShopifyProxy(req) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+/* ---------------------------
+   Signed cookie session
+---------------------------- */
+
+const AUTH_COOKIE = "nd_auth";
+
+function parseCookies(req) {
+  const header = String(req.headers.cookie || "");
+  const out = {};
+  header.split(";").forEach((part) => {
+    const i = part.indexOf("=");
+    if (i === -1) return;
+    const k = part.slice(0, i).trim();
+    const v = part.slice(i + 1).trim();
+    if (!k) return;
+    out[k] = decodeURIComponent(v);
+  });
+  return out;
+}
+
+function b64urlEncode(buf) {
+  return Buffer.from(buf)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function b64urlDecodeToString(s) {
+  const pad = s.length % 4 ? "=".repeat(4 - (s.length % 4)) : "";
+  const base64 = (s + pad).replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(base64, "base64").toString("utf8");
+}
+
+function signSession(payloadObj) {
+  const json = JSON.stringify(payloadObj);
+  const data = b64urlEncode(json);
+  const mac = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(data).digest("hex");
+  return `${data}.${mac}`;
+}
+
+function verifySession(token) {
+  if (!SHOPIFY_API_SECRET) return null;
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+
+  const [data, mac] = parts;
+  const expected = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(data).digest("hex");
+
+  const a = Buffer.from(expected, "utf8");
+  const b = Buffer.from(mac, "utf8");
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+
+  try {
+    const json = b64urlDecodeToString(data);
+    const obj = JSON.parse(json);
+    if (!obj || typeof obj !== "object") return null;
+
+    // Minimal required fields
+    if (typeof obj.customer_id !== "string" || !obj.customer_id) return null;
+    if (typeof obj.shop !== "string" || !obj.shop) return null;
+    if (typeof obj.path_prefix !== "string" || !obj.path_prefix) return null;
+
+    // Optional expiry
+    if (obj.exp && Date.now() > Number(obj.exp)) return null;
+
+    return obj;
+  } catch {
+    return null;
+  }
+}
+
+function setAuthCookie(res, payload) {
+  // 7 days
+  const exp = Date.now() + 7 * 24 * 60 * 60 * 1000;
+
+  const token = signSession({
+    customer_id: payload.customer_id,
+    shop: payload.shop,
+    path_prefix: payload.path_prefix,
+    exp,
+  });
+
+  // Set cookie for proxy path only
+  const parts = [];
+  parts.push(`${AUTH_COOKIE}=${encodeURIComponent(token)}`);
+  parts.push("Path=/proxy");
+  parts.push("HttpOnly");
+  parts.push("SameSite=Lax");
+  // Render is https behind proxy, setting Secure is correct
+  parts.push("Secure");
+  // 7 days
+  parts.push(`Max-Age=${7 * 24 * 60 * 60}`);
+
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+/* ---------------------------
+   Helpers
+---------------------------- */
+
 function basePathFromReq(req) {
+  // Prefer query path_prefix when present and signed
   const p = typeof req.query.path_prefix === "string" ? req.query.path_prefix : "";
-  return p && p.startsWith("/") ? p : "/apps/nuggetdepot";
+  if (p && p.startsWith("/")) return p;
+
+  // Fallback to cookie
+  const cookies = parseCookies(req);
+  const session = verifySession(cookies[AUTH_COOKIE]);
+  const sp = session?.path_prefix || "";
+  if (sp && sp.startsWith("/")) return sp;
+
+  return "/apps/nuggetdepot";
+}
+
+function getViewerCustomerId(req) {
+  const q = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  if (q) return q;
+
+  const cookies = parseCookies(req);
+  const session = verifySession(cookies[AUTH_COOKIE]);
+  return session?.customer_id || "";
+}
+
+function getShop(req) {
+  const q = typeof req.query.shop === "string" ? req.query.shop : "";
+  if (q) return q;
+
+  const cookies = parseCookies(req);
+  const session = verifySession(cookies[AUTH_COOKIE]);
+  return session?.shop || "";
 }
 
 function page(bodyHtml, reqForBase) {
@@ -275,36 +416,20 @@ function page(bodyHtml, reqForBase) {
 </html>`;
 }
 
-function requireProxyAuth(req, res, next) {
-  if (!SHOPIFY_API_SECRET) {
-    return res.status(200).type("html").send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, req));
-  }
-
-  if (!verifyShopifyProxy(req)) {
-    const keys = Object.keys(req.query || {}).sort().join(", ");
-    return res.status(200).type("html").send(
-      page(
-        `
-          <p class="error">Invalid proxy signature.</p>
-          <p class="muted">Path: <code>${req.originalUrl}</code></p>
-          <p class="muted">Query keys: <code>${keys || "none"}</code></p>
-        `,
-        req
-      )
-    );
-  }
-
-  return next();
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function cleanText(input, max = 80) {
   return String(input || "").trim().slice(0, max);
 }
 function cleanMultiline(input, max = 400) {
-  return String(input || "")
-    .replace(/\r\n/g, "\n")
-    .trim()
-    .slice(0, max);
+  return String(input || "").replace(/\r\n/g, "\n").trim().slice(0, max);
 }
 function initialsFor(first, last) {
   const a = (first || "").trim().slice(0, 1).toUpperCase();
@@ -327,14 +452,51 @@ function safeHandle(username) {
   if (!u) return "";
   return u.startsWith("@") ? u : `@${u}`;
 }
-function escapeHtml(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+
+/* ---------------------------
+   Auth middleware
+---------------------------- */
+
+function requireProxyAuth(req, res, next) {
+  if (!SHOPIFY_API_SECRET) {
+    return res.status(200).type("html").send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, req));
+  }
+
+  // If Shopify signed request is present and valid, accept and set cookie.
+  if (verifyShopifyProxy(req)) {
+    const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+    const customerId =
+      typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+    const pathPrefix = typeof req.query.path_prefix === "string" ? req.query.path_prefix : "/apps/nuggetdepot";
+
+    if (shop && customerId && pathPrefix) {
+      setAuthCookie(res, { shop, customer_id: customerId, path_prefix: pathPrefix });
+    }
+
+    return next();
+  }
+
+  // Otherwise fallback to cookie session.
+  const cookies = parseCookies(req);
+  const session = verifySession(cookies[AUTH_COOKIE]);
+  if (session) return next();
+
+  const keys = Object.keys(req.query || {}).sort().join(", ");
+  return res.status(200).type("html").send(
+    page(
+      `
+        <p class="error">Invalid proxy signature.</p>
+        <p class="muted">Path: <code>${req.originalUrl}</code></p>
+        <p class="muted">Query keys: <code>${keys || "none"}</code></p>
+      `,
+      req
+    )
+  );
 }
+
+/* ---------------------------
+   DB helpers
+---------------------------- */
 
 async function getProfile(customerId) {
   if (!pool) return null;
@@ -394,10 +556,7 @@ async function updateProfile(customerId, patch) {
   }
   vals.push(customerId);
 
-  await pool.query(
-    `UPDATE profiles_v2 SET ${sets.join(", ")}, updated_at=NOW() WHERE customer_id=$${i}`,
-    vals
-  );
+  await pool.query(`UPDATE profiles_v2 SET ${sets.join(", ")}, updated_at=NOW() WHERE customer_id=$${i}`, vals);
 }
 
 async function createPost({ shop, customerId, body, mediaBytes, mediaMime }) {
@@ -434,7 +593,10 @@ async function getPostMedia(postId) {
   return r.rows?.[0] || null;
 }
 
-/** Non-proxy root */
+/* ---------------------------
+   Non-proxy root
+---------------------------- */
+
 app.get("/", (req, res) => {
   res.type("html").send(`
     <h1>Nugget Depot</h1>
@@ -447,26 +609,23 @@ app.get("/", (req, res) => {
 });
 app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 
-/** Proxy */
+/* ---------------------------
+   Proxy routes
+---------------------------- */
+
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
-/** Feed (placeholder) */
 proxy.get("/", async (req, res) => {
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-
+  const customerId = getViewerCustomerId(req);
   if (!customerId) {
     return res.type("html").send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
-
   return res.type("html").send(page(`<p>Feed placeholder.</p>`, req));
 });
 
-/** Avatar */
 proxy.get("/me/avatar", async (req, res) => {
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId = getViewerCustomerId(req);
   if (!customerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
@@ -489,10 +648,8 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
-/** Post media */
 proxy.get("/posts/:id/media", async (req, res) => {
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId = getViewerCustomerId(req);
   if (!customerId) return res.status(200).type("text").send("Not logged in");
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
@@ -512,11 +669,9 @@ proxy.get("/posts/:id/media", async (req, res) => {
   }
 });
 
-/** My Profile */
 proxy.get("/me", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const shop = getShop(req);
+  const customerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   if (!customerId) {
@@ -529,8 +684,7 @@ proxy.get("/me", async (req, res) => {
   await ensureRow(customerId, shop);
 
   const profile = await getProfile(customerId);
-  const displayName =
-    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
 
   const handle = safeHandle(profile?.username);
   const handleLine = handle
@@ -561,8 +715,8 @@ proxy.get("/me", async (req, res) => {
                 : isVideo
                   ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
                   : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
-
               const when = new Date(p.created_at).toLocaleString();
+
               return `
                 <div class="postItem">
                   <div class="postMeta">
@@ -624,11 +778,9 @@ proxy.get("/me", async (req, res) => {
   );
 });
 
-/** Public profile */
 proxy.get("/u/:customerId", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const viewerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   const targetId = String(req.params.customerId || "").trim();
@@ -646,8 +798,7 @@ proxy.get("/u/:customerId", async (req, res) => {
   const profile = await getProfile(targetId);
   if (!profile) return res.type("html").send(page(`<p class="error">User not found.</p>`, req));
 
-  const displayName =
-    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
   const handle = safeHandle(profile?.username);
   const handleLine = handle
     ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
@@ -672,8 +823,8 @@ proxy.get("/u/:customerId", async (req, res) => {
                 : isVideo
                   ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
                   : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
-
               const when = new Date(p.created_at).toLocaleString();
+
               return `
                 <div class="postItem">
                   <div class="postMeta">
@@ -708,11 +859,8 @@ proxy.get("/u/:customerId", async (req, res) => {
   );
 });
 
-/** New post page */
 proxy.get("/post/new", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const customerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   if (!customerId) {
@@ -759,17 +907,14 @@ proxy.get("/post/new", async (req, res) => {
             const ta = document.getElementById('body');
             const media = document.getElementById('media');
             const btn = document.getElementById('sendBtn');
-
             function update(){
               const hasText = ta && ta.value && ta.value.trim().length > 0;
               const hasMedia = media && media.files && media.files.length > 0;
               const ok = hasText || hasMedia;
-
               btn.disabled = !ok;
               btn.style.opacity = btn.disabled ? '0.5' : '1';
               btn.style.cursor = btn.disabled ? 'not-allowed' : 'pointer';
             }
-
             if (ta) ta.addEventListener('input', update);
             if (media) media.addEventListener('change', update);
             update();
@@ -781,11 +926,9 @@ proxy.get("/post/new", async (req, res) => {
   );
 });
 
-/** Create post */
 proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const shop = getShop(req);
+  const customerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -807,16 +950,13 @@ proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
       "video/webm",
       "video/quicktime",
     ]);
-
     if (!allowed.has(file.mimetype)) return res.redirect(`${base}/post/new?type=1`);
-
     mediaBytes = file.buffer;
     mediaMime = file.mimetype;
   }
 
   const hasText = !!(body && body.trim());
   const hasMedia = !!mediaBytes;
-
   if (!hasText && !hasMedia) return res.redirect(`${base}/post/new?err=1`);
 
   try {
@@ -829,11 +969,9 @@ proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
   }
 });
 
-/** Edit profile */
 proxy.get("/me/edit", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const shop = getShop(req);
+  const customerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   if (!customerId) {
@@ -918,9 +1056,8 @@ proxy.get("/me/edit", async (req, res) => {
 });
 
 proxy.post("/me/edit", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const shop = getShop(req);
+  const customerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -942,9 +1079,8 @@ proxy.post("/me/edit", async (req, res) => {
 });
 
 proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const shop = getShop(req);
+  const customerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -966,8 +1102,8 @@ proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
   }
 });
 
-proxy.get("/collection", (_req, res) => res.type("html").send(page(`<p>Collection placeholder.</p>`, _req)));
-proxy.get("/trades", (_req, res) => res.type("html").send(page(`<p>Trades placeholder.</p>`, _req)));
+proxy.get("/collection", (req, res) => res.type("html").send(page(`<p>Collection placeholder.</p>`, req)));
+proxy.get("/trades", (req, res) => res.type("html").send(page(`<p>Trades placeholder.</p>`, req)));
 
 app.use("/proxy", proxy);
 
