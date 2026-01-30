@@ -7,7 +7,6 @@ app.disable("x-powered-by");
 
 app.use(express.urlencoded({ extended: false }));
 
-// Basic request logging (useful on Render)
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.originalUrl}`);
   next();
@@ -17,7 +16,13 @@ const SHOPIFY_API_SECRET = (process.env.SHOPIFY_API_SECRET || "").trim();
 const PORT = Number(process.env.PORT) || 3000;
 
 const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
-const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      // Works for Render Postgres
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
 
 async function ensureSchema() {
   if (!pool) return;
@@ -53,6 +58,7 @@ function verifyShopifyProxy(req) {
   delete query.signature;
 
   const message = buildProxyMessage(query);
+
   const digest = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(message).digest("hex");
 
   const a = Buffer.from(digest, "utf8");
@@ -83,7 +89,7 @@ function page(title, bodyHtml, shop) {
       .muted{opacity:.75}
       .grid{display:grid;grid-template-columns:180px 1fr;gap:8px 16px;margin-top:12px}
       .k{opacity:.75}
-      .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none}
+      .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;background:white;cursor:pointer}
       input{padding:10px 12px;border:1px solid #ddd;border-radius:10px;width:280px;max-width:100%}
       label{display:block;margin-top:12px;margin-bottom:6px}
       .error{color:#b00020}
@@ -107,7 +113,6 @@ function page(title, bodyHtml, shop) {
 </html>`;
 }
 
-// Root page (Render URL)
 app.get("/", (req, res) => {
   res.type("html").send(`
     <h1>Nugget Depot</h1>
@@ -119,10 +124,8 @@ app.get("/", (req, res) => {
   `);
 });
 
-// Health check for Render
 app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 
-// Proxy routes
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
@@ -131,13 +134,20 @@ proxy.get("/", (req, res) => {
   res.type("html").send(page("Nugget Depot", `<p>Proxy working.</p><p>Use the navigation above.</p>`, shop));
 });
 
+function cleanUsername(input) {
+  const u = String(input || "").trim();
+  // 3–20 chars, letters/numbers/_/./-
+  if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(u)) return "";
+  return u;
+}
+
 async function getUsername(shop, customerId) {
   if (!pool) return "";
   await ensureSchema();
-  const r = await pool.query(
-    "SELECT username FROM profiles WHERE shop=$1 AND customer_id=$2",
-    [shop, customerId]
-  );
+  const r = await pool.query("SELECT username FROM profiles WHERE shop=$1 AND customer_id=$2", [
+    shop,
+    customerId,
+  ]);
   return r.rows?.[0]?.username || "";
 }
 
@@ -153,19 +163,12 @@ async function setUsername(shop, customerId, username) {
   );
 }
 
-function cleanUsername(input) {
-  const u = String(input || "").trim();
-  // Allow letters, numbers, underscore, dash, dot. 3-20 chars.
-  if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(u)) return "";
-  return u;
-}
-
-// My Profile: shows login state + lets you set username
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const saved = req.query.saved === "1";
+  const err = req.query.err === "1";
 
   if (!customerId) {
     return res
@@ -174,24 +177,26 @@ proxy.get("/me", async (req, res) => {
   }
 
   const username = await getUsername(shop, customerId);
-  const status = saved ? `<p class="ok">Saved.</p>` : "";
 
-  const dbNote = pool
+  const dbWarning = pool
     ? ""
-    : `<p class="error">DATABASE_URL not set. Create Render Postgres and add DATABASE_URL.</p>`;
+    : `<p class="error">DATABASE_URL not set. Create Render Postgres and add DATABASE_URL to the web service.</p>`;
 
-  return res.type("html").send(
+  const status = saved ? `<p class="ok">Saved.</p>` : err ? `<p class="error">Invalid username.</p>` : "";
+
+  res.type("html").send(
     page(
       "My Profile",
       `
         ${status}
-        ${dbNote}
+        ${dbWarning}
+
         <div class="grid">
           <div class="k">Customer ID</div><div><code>${customerId}</code></div>
           <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
         </div>
 
-        <form method="POST" action="/proxy/me/username?shop=${encodeURIComponent(shop)}&logged_in_customer_id=${encodeURIComponent(customerId)}">
+        <form method="POST" action="/apps/nuggetdepot/me/username">
           <label for="username">Set username</label>
           <input id="username" name="username" placeholder="ex: nuggetking" value="${username || ""}" />
           <div class="muted">3–20 characters. Letters, numbers, underscore, dash, dot.</div>
@@ -203,7 +208,6 @@ proxy.get("/me", async (req, res) => {
   );
 });
 
-// Save username
 proxy.post("/me/username", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -215,21 +219,15 @@ proxy.post("/me/username", async (req, res) => {
 
   const username = cleanUsername(req.body?.username);
   if (!username) {
-    return res
-      .status(400)
-      .type("html")
-      .send(page("My Profile", `<p class="error">Invalid username. Use 3–20 characters: letters, numbers, _ . -</p><a class="btn" href="/apps/nuggetdepot/me">Back</a>`, shop));
+    return res.redirect("/apps/nuggetdepot/me?err=1");
   }
 
   try {
     await setUsername(shop, customerId, username);
-    return res.redirect(`/apps/nuggetdepot/me?saved=1`);
+    return res.redirect("/apps/nuggetdepot/me?saved=1");
   } catch (e) {
     console.error(e);
-    return res
-      .status(500)
-      .type("html")
-      .send(page("My Profile", `<p class="error">Could not save username. Check DATABASE_URL.</p>`, shop));
+    return res.status(500).type("html").send(page("My Profile", `<p class="error">Could not save. Check DATABASE_URL.</p>`, shop));
   }
 });
 
@@ -245,7 +243,6 @@ proxy.get("/trades", (req, res) => {
 
 app.use("/proxy", proxy);
 
-// 404 fallback
 app.use((req, res) => res.status(404).type("text").send("Not found"));
 
 const server = app.listen(PORT, "0.0.0.0", () => {
