@@ -26,6 +26,9 @@
 // - Feed top shows Gold Nugget logo (half-size)
 // - Prevent HTML caching (no 304s for proxy pages)
 // - Server logs do not include querystring
+// UPDATE (LOGIN REDIRECT):
+// - All "Log in" links now send Shopify login with return_url=https://www.goldnuggetcards.com/
+//   so after Shopify login they land on the homepage.
 
 import express from "express";
 import crypto from "crypto";
@@ -62,6 +65,17 @@ const pool = DATABASE_URL
 
 const GOLD_NUGGET_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0681/6589/4299/files/LOGO_w_TEXT_-_Gold_Nugget_467d90fd-4797-4d4f-9ddc-f86b47c98edf.png?v=1748970231";
+
+/* ---------------------------
+   Login helper (Shopify)
+---------------------------- */
+
+const LOGIN_RETURN_URL = "https://www.goldnuggetcards.com/";
+
+// Shopify login link that returns to site home after auth
+function shopifyLoginHref() {
+  return `/account/login?return_url=${encodeURIComponent(LOGIN_RETURN_URL)}`;
+}
 
 /* ---------------------------
    Uploaders (multi-media)
@@ -1679,7 +1693,7 @@ proxy.get("/", async (req, res) => {
   if (!viewerId) {
     return res
       .type("html")
-      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+      .send(page(`<p>Please log in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -1907,7 +1921,7 @@ proxy.get("/me", async (req, res) => {
   if (!viewerId) {
     return res
       .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -2009,7 +2023,7 @@ proxy.get("/u/:customerId", async (req, res) => {
   if (!viewerId) {
     return res
       .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -2080,7 +2094,7 @@ proxy.get("/collection", async (req, res) => {
   if (!viewerId) {
     return res
       .type("html")
-      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+      .send(page(`<p>Please log in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -2186,7 +2200,7 @@ proxy.get("/trades", async (req, res) => {
   if (!viewerId) {
     return res
       .type("html")
-      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+      .send(page(`<p>Please log in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -2320,7 +2334,7 @@ proxy.get("/post/new", async (req, res) => {
   if (!viewerId) {
     return res
       .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -2458,7 +2472,7 @@ proxy.get("/me/edit", async (req, res) => {
   if (!viewerId) {
     return res
       .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
