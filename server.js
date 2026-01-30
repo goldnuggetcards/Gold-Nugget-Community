@@ -25,13 +25,13 @@ const pool = DATABASE_URL
 
 async function ensureSchema() {
   if (!pool) return;
+  // v2: key by customer_id only so shop changes do not “lose” data
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS profiles (
+    CREATE TABLE IF NOT EXISTS profiles_v2 (
+      customer_id TEXT PRIMARY KEY,
       shop TEXT NOT NULL,
-      customer_id TEXT NOT NULL,
       username TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (shop, customer_id)
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 }
@@ -138,34 +138,30 @@ function cleanUsername(input) {
   return u;
 }
 
-async function getUsername(shop, customerId) {
+async function getUsername(customerId) {
   if (!pool) return "";
   await ensureSchema();
-  const r = await pool.query("SELECT username FROM profiles WHERE shop=$1 AND customer_id=$2", [
-    shop,
-    customerId,
-  ]);
+  const r = await pool.query("SELECT username FROM profiles_v2 WHERE customer_id=$1", [customerId]);
   return r.rows?.[0]?.username || "";
 }
 
-async function setUsername(shop, customerId, username) {
+async function setUsername(customerId, shop, username) {
   if (!pool) throw new Error("DB not configured");
   await ensureSchema();
   await pool.query(
-    `INSERT INTO profiles (shop, customer_id, username)
+    `INSERT INTO profiles_v2 (customer_id, shop, username)
      VALUES ($1,$2,$3)
-     ON CONFLICT (shop, customer_id)
-     DO UPDATE SET username=EXCLUDED.username, updated_at=NOW()`,
-    [shop, customerId, username]
+     ON CONFLICT (customer_id)
+     DO UPDATE SET username=EXCLUDED.username, shop=EXCLUDED.shop, updated_at=NOW()`,
+    [customerId, shop, username]
   );
 }
 
 function signedQueryString(req) {
-  // Keep all existing proxy params so the save request is signed
   return new URLSearchParams(req.query).toString();
 }
 
-async function renderProfile(req, res, { saved = false, invalid = false } = {}) {
+async function renderProfile(req, res, { saved = false, invalid = false, dbError = false } = {}) {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
@@ -176,17 +172,19 @@ async function renderProfile(req, res, { saved = false, invalid = false } = {}) 
       .send(page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
   }
 
-  const username = await getUsername(shop, customerId);
+  const username = await getUsername(customerId);
 
   const dbWarning = pool
     ? ""
     : `<p class="error">DATABASE_URL not set. Create Render Postgres and add DATABASE_URL to the web service.</p>`;
 
-  const status = saved
-    ? `<p class="ok">Saved.</p>`
-    : invalid
-      ? `<p class="error">Invalid username.</p>`
-      : "";
+  const status = dbError
+    ? `<p class="error">Could not save. Check Render logs for Postgres error.</p>`
+    : saved
+      ? `<p class="ok">Saved.</p>`
+      : invalid
+        ? `<p class="error">Invalid username.</p>`
+        : "";
 
   const qs = signedQueryString(req);
 
@@ -202,7 +200,6 @@ async function renderProfile(req, res, { saved = false, invalid = false } = {}) 
           <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
         </div>
 
-        <!-- Use GET because Shopify App Proxy often does not forward POST -->
         <form method="GET" action="/apps/nuggetdepot/me/username?${qs}">
           <label for="username">Set username</label>
           <input id="username" name="username" placeholder="ex: nuggetking" value="${username || ""}" />
@@ -219,7 +216,6 @@ proxy.get("/me", async (req, res) => {
   return renderProfile(req, res);
 });
 
-// Save username via GET (signed)
 proxy.get("/me/username", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -235,14 +231,11 @@ proxy.get("/me/username", async (req, res) => {
   }
 
   try {
-    await setUsername(shop, customerId, username);
+    await setUsername(customerId, shop, username);
     return renderProfile(req, res, { saved: true });
   } catch (e) {
-    console.error(e);
-    return res
-      .status(500)
-      .type("html")
-      .send(page("My Profile", `<p class="error">Could not save. Check DATABASE_URL.</p>`, shop));
+    console.error("setUsername error:", e);
+    return renderProfile(req, res, { dbError: true });
   }
 });
 
