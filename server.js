@@ -38,6 +38,7 @@ async function ensureSchema() {
     );
   `);
 
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS dob DATE`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`);
@@ -77,7 +78,7 @@ function requireProxyAuth(req, res, next) {
   return next();
 }
 
-function page(title, bodyHtml, shop) {
+function page(title, bodyHtml, shop, nav = true) {
   const safeShop = shop || "unknown";
   return `<!doctype html>
 <html>
@@ -101,17 +102,19 @@ function page(title, bodyHtml, shop) {
       .ok{color:#137333}
       hr{border:none;border-top:1px solid #eee;margin:12px 0}
       .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+      .center{max-width:520px}
     </style>
   </head>
   <body>
+    ${nav ? `
     <div class="nav">
       <a href="/apps/nuggetdepot">Feed</a>
       <a href="/apps/nuggetdepot/me">My Profile</a>
       <a href="/apps/nuggetdepot/collection">My Collection</a>
       <a href="/apps/nuggetdepot/trades">Trades</a>
     </div>
-    <hr/>
-    <div class="card">
+    <hr/>` : ``}
+    <div class="card ${nav ? "" : "center"}">
       <h1>${title}</h1>
       ${bodyHtml}
       <p class="muted">Shop: <code>${safeShop}</code></p>
@@ -130,7 +133,7 @@ function cleanUsername(input) {
   return u;
 }
 
-function cleanText(input, max = 60) {
+function cleanText(input, max = 80) {
   return String(input || "").trim().slice(0, max);
 }
 
@@ -196,54 +199,55 @@ app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
-/** Feed placeholder */
+/** FEED (placeholder). Requires Shopify login. */
 proxy.get("/", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
+  const qs = signedQueryString(req);
+
   if (!customerId) {
-    const qs = signedQueryString(req);
-    return res
-      .type("html")
-      .send(
-        page(
-          "Nugget Depot",
-          `<p>Please log in to view the community feed.</p>
-           <a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in / Create account</a>`,
-          shop
-        )
-      );
+    return res.type("html").send(
+      page(
+        "Nugget Depot",
+        `
+          <p>Please log in to view the community feed.</p>
+          <a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>
+        `,
+        shop
+      )
+    );
   }
 
   return res.type("html").send(
     page(
       "Community Feed",
-      `<p>Feed placeholder.</p>
-       <p class="muted">Next: posts table, image uploads, likes/comments.</p>`,
+      `
+        <p>Feed placeholder.</p>
+        <p class="muted">Next: posts table, image uploads, likes/comments.</p>
+      `,
       shop
     )
   );
 });
 
-/** Profile overview */
+/** PROFILE OVERVIEW */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
+  const qs = signedQueryString(req);
+
   if (!customerId) {
-    const qs = signedQueryString(req);
-    return res
-      .type("html")
-      .send(
-        page(
-          "My Profile",
-          `<p>You are not logged in.</p>
-           <a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in / Create account</a>`,
-          shop
-        )
-      );
+    return res.type("html").send(
+      page(
+        "My Profile",
+        `<p>You are not logged in.</p><a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>`,
+        shop
+      )
+    );
   }
 
   const profile = await getProfile(customerId);
@@ -252,55 +256,72 @@ proxy.get("/me", async (req, res) => {
   const dob = profile?.dob ? String(profile.dob).slice(0, 10) : "";
   const fav = profile?.favorite_pokemon || "";
 
-  const qs = signedQueryString(req);
+  const needsOnboarding = !username || !fullName || !dob || !fav;
 
   return res.type("html").send(
     page(
       "My Profile",
       `
-      <div class="grid">
-        <div class="k">Customer ID</div><div><code>${customerId}</code></div>
-        <div class="k">Full name</div><div>${fullName ? `<strong>${fullName}</strong>` : `<span class="muted">Not set</span>`}</div>
-        <div class="k">DOB</div><div>${dob ? `<strong>${dob}</strong>` : `<span class="muted">Not set</span>`}</div>
-        <div class="k">Favorite Pokémon</div><div>${fav ? `<strong>${fav}</strong>` : `<span class="muted">Not set</span>`}</div>
-        <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
-      </div>
+        ${needsOnboarding ? `<p class="error">Profile incomplete. Please finish setup.</p>` : ""}
 
-      <div class="row">
-        <a class="btn" href="/apps/nuggetdepot/onboarding?${qs}">Edit profile</a>
-        <a class="btn" href="/apps/nuggetdepot">Back to feed</a>
-      </div>
+        <div class="grid">
+          <div class="k">Customer ID</div><div><code>${customerId}</code></div>
+          <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
+          <div class="k">Full name</div><div>${fullName ? `<strong>${fullName}</strong>` : `<span class="muted">Not set</span>`}</div>
+          <div class="k">DOB</div><div>${dob ? `<strong>${dob}</strong>` : `<span class="muted">Not set</span>`}</div>
+          <div class="k">Favorite Pokémon</div><div>${fav ? `<strong>${fav}</strong>` : `<span class="muted">Not set</span>`}</div>
+        </div>
+
+        <div class="row">
+          <a class="btn" href="/apps/nuggetdepot/onboarding?${qs}">Edit profile</a>
+          <a class="btn" href="/apps/nuggetdepot">Go to feed</a>
+        </div>
       `,
       shop
     )
   );
 });
 
-/** Login / Signup gateway */
+/**
+ * LOGIN / SIGNUP PAGE
+ * You asked for username + password, but Shopify login is email + password.
+ * This page uses Shopify's built-in customer auth.
+ */
 proxy.get("/me/username", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
+  const returnUrl = "/apps/nuggetdepot";
+
+  // If already logged in, go to feed (or onboarding if missing profile fields)
   if (customerId) {
+    const profile = await getProfile(customerId);
+    const needsOnboarding =
+      !profile?.username || !profile?.full_name || !profile?.dob || !profile?.favorite_pokemon;
+
     const qs = signedQueryString(req);
+
     return res.type("html").send(
       page(
         "Welcome Back",
         `
           <p>You are logged in.</p>
           <div class="row">
-            <a class="btn" href="/apps/nuggetdepot">Go to feed</a>
-            <a class="btn" href="/apps/nuggetdepot/onboarding?${qs}">Complete profile</a>
+            <a class="btn" href="${needsOnboarding ? `/apps/nuggetdepot/onboarding?${qs}` : "/apps/nuggetdepot"}">
+              ${needsOnboarding ? "Finish setup" : "Go to feed"}
+            </a>
+            <a class="btn" href="/apps/nuggetdepot/me">My Profile</a>
           </div>
         `,
-        shop
+        shop,
+        false
       )
     );
   }
 
-  const returnUrl = "/apps/nuggetdepot";
-  const registerUrl = `/account/register?return_url=${encodeURIComponent(returnUrl)}`;
+  // Shopify register page can redirect to onboarding after account creation
+  const registerUrl = `/account/register?return_url=${encodeURIComponent("/apps/nuggetdepot/onboarding")}`;
 
   return res.type("html").send(
     page(
@@ -320,33 +341,38 @@ proxy.get("/me/username", async (req, res) => {
 
         <hr/>
 
-        <a class="btn" href="${registerUrl}">Create account</a>
-        <div class="muted" style="margin-top:8px">Account creation happens on Shopify, then you return here.</div>
+        <a href="${registerUrl}">Create account</a>
       `,
-      shop
+      shop,
+      false
     )
   );
 });
 
-/** Onboarding form */
+/** SIGNUP DETAILS (your custom fields) */
 proxy.get("/onboarding", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
+  const qs = signedQueryString(req);
+
   if (!customerId) {
-    const qs = signedQueryString(req);
     return res.type("html").send(
       page(
-        "Complete Your Profile",
-        `<p>Please log in first.</p><a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>`,
-        shop
+        "Create account",
+        `
+          <p>Please create an account or log in first.</p>
+          <a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>
+          <a class="btn" style="margin-left:8px" href="/account/register?return_url=${encodeURIComponent("/apps/nuggetdepot/onboarding")}">Create account</a>
+        `,
+        shop,
+        false
       )
     );
   }
 
   const profile = await getProfile(customerId);
-  const qs = signedQueryString(req);
 
   const fullName = profile?.full_name || "";
   const dob = profile?.dob ? String(profile.dob).slice(0, 10) : "";
@@ -364,7 +390,7 @@ proxy.get("/onboarding", async (req, res) => {
 
   return res.type("html").send(
     page(
-      "Create Your Profile",
+      "Create account",
       `
         ${status}
 
@@ -383,15 +409,18 @@ proxy.get("/onboarding", async (req, res) => {
           <div class="muted">3–20 characters. Letters, numbers, underscore, dash, dot.</div>
 
           <button class="btn" type="submit">Enter</button>
-          <a class="btn" style="margin-left:8px" href="/apps/nuggetdepot">Back</a>
         </form>
+
+        <div class="muted" style="margin-top:10px">
+          Email and password are managed by Shopify. These fields are your community profile.
+        </div>
       `,
-      shop
+      shop,
+      false
     )
   );
 });
 
-/** Onboarding save */
 proxy.get("/onboarding/save", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -400,7 +429,12 @@ proxy.get("/onboarding/save", async (req, res) => {
 
   if (!customerId) {
     return res.type("html").send(
-      page("Create Your Profile", `<p>Please log in.</p><a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>`, shop)
+      page(
+        "Create account",
+        `<p>Please log in first.</p><a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>`,
+        shop,
+        false
+      )
     );
   }
 
@@ -410,14 +444,7 @@ proxy.get("/onboarding/save", async (req, res) => {
   const dob = cleanDob(req.query.dob);
 
   if (!full_name || !favorite_pokemon || !username || !dob) {
-    return res.type("html").send(
-      page(
-        "Create Your Profile",
-        `<p class="error">Please check your inputs.</p>
-         <a class="btn" href="/apps/nuggetdepot/onboarding?err=1&${qs}">Back</a>`,
-        shop
-      )
-    );
+    return res.redirect(`/apps/nuggetdepot/onboarding?err=1&${qs}`);
   }
 
   try {
@@ -428,24 +455,10 @@ proxy.get("/onboarding/save", async (req, res) => {
       dob,
     });
 
-    return res.type("html").send(
-      page(
-        "Welcome",
-        `<p class="ok">Profile saved.</p>
-         <a class="btn" href="/apps/nuggetdepot">Enter feed</a>`,
-        shop
-      )
-    );
+    return res.redirect(`/apps/nuggetdepot?${qs}`);
   } catch (e) {
     console.error("onboarding save error:", e);
-    return res.type("html").send(
-      page(
-        "Create Your Profile",
-        `<p class="error">Could not save. Check Render logs.</p>
-         <a class="btn" href="/apps/nuggetdepot/onboarding?dberr=1&${qs}">Back</a>`,
-        shop
-      )
-    );
+    return res.redirect(`/apps/nuggetdepot/onboarding?dberr=1&${qs}`);
   }
 });
 
