@@ -8,8 +8,13 @@ app.disable("x-powered-by");
 
 app.use(express.urlencoded({ extended: false }));
 
+// Status + timing logger (helps diagnose Shopify proxy errors)
 app.use((req, res, next) => {
-  console.log(`${req.method} ${req.originalUrl}`);
+  const start = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    console.log(`${res.statusCode} ${req.method} ${req.originalUrl} (${ms}ms)`);
+  });
   next();
 });
 
@@ -89,12 +94,6 @@ function verifyShopifyProxy(req) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function requireProxyAuth(req, res, next) {
-  if (!SHOPIFY_API_SECRET) return res.status(500).type("text").send("Missing SHOPIFY_API_SECRET");
-  if (!verifyShopifyProxy(req)) return res.status(401).type("text").send("Invalid proxy signature");
-  return next();
-}
-
 function page(title, bodyHtml, shop, nav = true) {
   const safeShop = shop || "unknown";
   return `<!doctype html>
@@ -152,6 +151,39 @@ function page(title, bodyHtml, shop, nav = true) {
     </div>
   </body>
 </html>`;
+}
+
+// Return HTML on auth failure so Shopify does not show the generic third party error page
+function requireProxyAuth(req, res, next) {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+
+  if (!SHOPIFY_API_SECRET) {
+    return res.status(200).type("html").send(
+      page(
+        "Config error",
+        `<p class="error">Missing SHOPIFY_API_SECRET</p>`,
+        shop
+      )
+    );
+  }
+
+  if (!verifyShopifyProxy(req)) {
+    const keys = Object.keys(req.query || {}).sort().join(", ");
+    return res.status(200).type("html").send(
+      page(
+        "Proxy auth failed",
+        `
+          <p class="error">Invalid proxy signature.</p>
+          <p class="muted">Path: <code>${req.originalUrl}</code></p>
+          <p class="muted">Query keys: <code>${keys || "none"}</code></p>
+          <p class="muted small">If this page appears, Shopify is reaching your server but the proxy signature check is failing.</p>
+        `,
+        shop
+      )
+    );
+  }
+
+  return next();
 }
 
 function signedQueryString(req) {
@@ -260,7 +292,6 @@ proxy.use(requireProxyAuth);
 proxy.get("/", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-  const qs = signedQueryString(req);
 
   if (!customerId) {
     return res.type("html").send(
@@ -283,13 +314,12 @@ proxy.get("/", async (req, res) => {
   );
 });
 
-/** Avatar image endpoint (must include signed query string in img src) */
+/** Avatar image endpoint (img src must include signed query string) */
 proxy.get("/me/avatar", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
-  if (!customerId) return res.status(401).type("text").send("Not logged in");
-  if (!pool) return res.status(500).type("text").send("DB not configured");
+  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
 
   try {
     const a = await getAvatar(customerId);
@@ -306,7 +336,7 @@ proxy.get("/me/avatar", async (req, res) => {
     return res.status(200).send(svgAvatar(ini));
   } catch (e) {
     console.error("avatar error:", e);
-    return res.status(500).type("text").send("Avatar error");
+    return res.status(200).type("text").send("Avatar error");
   }
 });
 
@@ -336,7 +366,6 @@ proxy.get("/me", async (req, res) => {
     );
   }
 
-  // Ensure row exists so name/avatar updates work even before onboarding
   await ensureRow(customerId, shop);
 
   const profile = await getProfile(customerId);
@@ -409,8 +438,8 @@ proxy.post("/me/name", async (req, res) => {
   const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
-  if (!customerId) return res.status(401).type("text").send("Not logged in");
-  if (!pool) return res.status(500).type("text").send("DB not configured");
+  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const first_name = cleanText(req.body?.first_name, 40);
   const last_name = cleanText(req.body?.last_name, 40);
@@ -433,8 +462,8 @@ proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
   const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
-  if (!customerId) return res.status(401).type("text").send("Not logged in");
-  if (!pool) return res.status(500).type("text").send("DB not configured");
+  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const file = req.file;
   if (!file || !file.buffer || !file.mimetype) return res.redirect(`/apps/nuggetdepot/me?imgerr=1&${qs}`);
