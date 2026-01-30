@@ -1,6 +1,7 @@
 import express from "express";
 import crypto from "crypto";
 import { Pool } from "pg";
+import multer from "multer";
 
 const app = express();
 app.disable("x-powered-by");
@@ -23,10 +24,16 @@ const pool = DATABASE_URL
     })
   : null;
 
+// Multer in-memory uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+});
+
 async function ensureSchema() {
   if (!pool) return;
 
-  // Create table if missing (includes all columns)
+  // Base table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS profiles_v2 (
       customer_id TEXT PRIMARY KEY,
@@ -39,13 +46,19 @@ async function ensureSchema() {
     );
   `);
 
-  // If table existed from earlier versions, ensure columns exist
+  // Add fields we need for profile display
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
+
+  // Avatar stored in DB (MVP)
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
+
+  // Keep older columns safe (no-op if already present)
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS dob DATE`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`);
 }
 
 function buildProxyMessage(query) {
@@ -107,21 +120,31 @@ function page(title, bodyHtml, shop, nav = true) {
       hr{border:none;border-top:1px solid #eee;margin:12px 0}
       .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
       .center{max-width:520px}
+      .profileTop{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+      .avatarWrap{width:120px}
+      .avatar{
+        width:120px;height:120px;
+        border-radius:16px;
+        object-fit:cover;
+        aspect-ratio:1/1;
+        border:1px solid #ddd;
+        background:#fafafa;
+        display:block;
+      }
+      .nameUnder{margin-top:10px;font-weight:700}
+      .subUnder{margin-top:2px}
+      .small{font-size:13px}
     </style>
   </head>
   <body>
-    ${
-      nav
-        ? `
+    ${nav ? `
     <div class="nav">
       <a href="/apps/nuggetdepot">Feed</a>
       <a href="/apps/nuggetdepot/me">My Profile</a>
       <a href="/apps/nuggetdepot/collection">My Collection</a>
       <a href="/apps/nuggetdepot/trades">Trades</a>
     </div>
-    <hr/>`
-        : ``
-    }
+    <hr/>` : ``}
     <div class="card ${nav ? "" : "center"}">
       <h1>${title}</h1>
       ${bodyHtml}
@@ -135,62 +158,83 @@ function signedQueryString(req) {
   return new URLSearchParams(req.query).toString();
 }
 
-function cleanUsername(input) {
-  const u = String(input || "").trim();
-  if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(u)) return "";
-  return u;
-}
-
 function cleanText(input, max = 80) {
   return String(input || "").trim().slice(0, max);
 }
 
-function cleanDob(input) {
-  const s = String(input || "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
-  return s;
+function initialsFor(first, last) {
+  const a = (first || "").trim().slice(0, 1).toUpperCase();
+  const b = (last || "").trim().slice(0, 1).toUpperCase();
+  const x = `${a}${b}`.trim();
+  return x || "GN";
+}
+
+function svgAvatar(initials) {
+  const safe = String(initials || "GN").replace(/[^A-Z0-9]/g, "").slice(0, 2) || "GN";
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">
+  <rect width="240" height="240" rx="32" fill="#f2f2f2"/>
+  <text x="50%" y="54%" text-anchor="middle" dominant-baseline="middle"
+        font-family="system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif"
+        font-size="84" fill="#111">${safe}</text>
+</svg>`;
 }
 
 async function getProfile(customerId) {
   if (!pool) return null;
   await ensureSchema();
   const r = await pool.query(
-    "SELECT customer_id, shop, username, full_name, dob, favorite_pokemon FROM profiles_v2 WHERE customer_id=$1",
+    `SELECT customer_id, shop, username, full_name, dob, favorite_pokemon,
+            first_name, last_name, avatar_mime
+     FROM profiles_v2
+     WHERE customer_id=$1`,
     [customerId]
   );
   return r.rows?.[0] || null;
 }
 
-async function upsertProfile(customerId, shop, patch) {
+async function getAvatar(customerId) {
+  if (!pool) return null;
+  await ensureSchema();
+  const r = await pool.query(
+    `SELECT avatar_bytes, avatar_mime, first_name, last_name
+     FROM profiles_v2
+     WHERE customer_id=$1`,
+    [customerId]
+  );
+  return r.rows?.[0] || null;
+}
+
+async function ensureRow(customerId, shop) {
   if (!pool) throw new Error("DB not configured");
   await ensureSchema();
-
-  // Ensure base row exists
   await pool.query(
     `INSERT INTO profiles_v2 (customer_id, shop)
      VALUES ($1,$2)
-     ON CONFLICT (customer_id) DO UPDATE
-     SET shop=EXCLUDED.shop, updated_at=NOW()`,
+     ON CONFLICT (customer_id) DO UPDATE SET shop=EXCLUDED.shop, updated_at=NOW()`,
     [customerId, shop]
   );
+}
 
-  const entries = Object.entries(patch).filter(([, v]) => v !== undefined);
-  if (entries.length === 0) return;
+async function updateProfile(customerId, patch) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
 
-  const fields = [];
-  const values = [];
-  let idx = 1;
+  const keys = Object.keys(patch);
+  if (keys.length === 0) return;
 
-  for (const [k, v] of entries) {
-    fields.push(`${k}=$${idx++}`);
-    values.push(v);
+  const sets = [];
+  const vals = [];
+  let i = 1;
+  for (const k of keys) {
+    sets.push(`${k}=$${i++}`);
+    vals.push(patch[k]);
   }
-
-  values.push(customerId);
+  vals.push(customerId);
 
   await pool.query(
-    `UPDATE profiles_v2 SET ${fields.join(", ")}, updated_at=NOW() WHERE customer_id=$${idx}`,
-    values
+    `UPDATE profiles_v2 SET ${sets.join(", ")}, updated_at=NOW() WHERE customer_id=$${i}`,
+    vals
   );
 }
 
@@ -212,22 +256,18 @@ app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
-/** FEED (placeholder). Requires Shopify login. */
+/** FEED (placeholder) */
 proxy.get("/", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
   if (!customerId) {
     return res.type("html").send(
       page(
         "Nugget Depot",
-        `
-          <p>Please log in to view the community feed.</p>
-          <a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>
-        `,
+        `<p>Please log in to view the community feed.</p>
+         <a class="btn" href="/account/login">Log in</a>`,
         shop
       )
     );
@@ -236,58 +276,126 @@ proxy.get("/", async (req, res) => {
   return res.type("html").send(
     page(
       "Community Feed",
-      `
-        <p>Feed placeholder.</p>
-        <p class="muted">Next: posts table, image uploads, likes/comments.</p>
-      `,
+      `<p>Feed placeholder.</p>
+       <p class="muted">Next: posts table, image uploads, likes/comments.</p>`,
       shop
     )
   );
 });
 
-/** PROFILE OVERVIEW */
+/** Avatar image endpoint (must include signed query string in img src) */
+proxy.get("/me/avatar", async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+
+  if (!customerId) return res.status(401).type("text").send("Not logged in");
+  if (!pool) return res.status(500).type("text").send("DB not configured");
+
+  try {
+    const a = await getAvatar(customerId);
+
+    if (a?.avatar_bytes && a?.avatar_mime) {
+      res.setHeader("Content-Type", a.avatar_mime);
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).send(a.avatar_bytes);
+    }
+
+    const ini = initialsFor(a?.first_name || "", a?.last_name || "");
+    res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(svgAvatar(ini));
+  } catch (e) {
+    console.error("avatar error:", e);
+    return res.status(500).type("text").send("Avatar error");
+  }
+});
+
+/** PROFILE PAGE */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
   if (!customerId) {
     return res.type("html").send(
       page(
         "My Profile",
-        `<p>You are not logged in.</p><a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>`,
+        `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`,
         shop
       )
     );
   }
 
-  const profile = await getProfile(customerId);
-  const username = profile?.username || "";
-  const fullName = profile?.full_name || "";
-  const dob = profile?.dob ? String(profile.dob).slice(0, 10) : "";
-  const fav = profile?.favorite_pokemon || "";
+  if (!pool) {
+    return res.type("html").send(
+      page(
+        "My Profile",
+        `<p class="error">DATABASE_URL not set. Add it on Render.</p>`,
+        shop
+      )
+    );
+  }
 
-  const needsOnboarding = !username || !fullName || !dob || !fav;
+  // Ensure row exists so name/avatar updates work even before onboarding
+  await ensureRow(customerId, shop);
+
+  const profile = await getProfile(customerId);
+  const first = profile?.first_name || "";
+  const last = profile?.last_name || "";
+  const displayName = `${first} ${last}`.trim() || "Name not set";
+
+  const status =
+    req.query.saved === "1"
+      ? `<p class="ok">Saved.</p>`
+      : req.query.err === "1"
+        ? `<p class="error">Please check your inputs.</p>`
+        : req.query.imgerr === "1"
+          ? `<p class="error">Upload a PNG, JPG, or WEBP under 2MB.</p>`
+          : "";
+
+  const avatarSrc = `/apps/nuggetdepot/me/avatar?${qs}`;
 
   return res.type("html").send(
     page(
       "My Profile",
       `
-        ${needsOnboarding ? `<p class="error">Profile incomplete. Please finish setup.</p>` : ""}
+        ${status}
 
-        <div class="grid">
-          <div class="k">Customer ID</div><div><code>${customerId}</code></div>
-          <div class="k">Username</div><div>${username ? `<strong>${username}</strong>` : `<span class="muted">Not set</span>`}</div>
-          <div class="k">Full name</div><div>${fullName ? `<strong>${fullName}</strong>` : `<span class="muted">Not set</span>`}</div>
-          <div class="k">DOB</div><div>${dob ? `<strong>${dob}</strong>` : `<span class="muted">Not set</span>`}</div>
-          <div class="k">Favorite Pokémon</div><div>${fav ? `<strong>${fav}</strong>` : `<span class="muted">Not set</span>`}</div>
-        </div>
+        <div class="profileTop">
+          <div class="avatarWrap">
+            <img class="avatar" src="${avatarSrc}" alt="Profile photo" />
+            <div class="nameUnder">${displayName}</div>
+            <div class="muted subUnder small">Community profile</div>
+          </div>
 
-        <div class="row">
-          <a class="btn" href="/apps/nuggetdepot/onboarding?${qs}">Edit profile</a>
-          <a class="btn" href="/apps/nuggetdepot">Go to feed</a>
+          <div style="min-width:260px;flex:1">
+            <div class="grid">
+              <div class="k">Customer ID</div><div><code>${customerId}</code></div>
+              <div class="k">Username</div><div>${profile?.username ? `<strong>${profile.username}</strong>` : `<span class="muted">Not set</span>`}</div>
+            </div>
+
+            <hr/>
+
+            <h3 style="margin:0 0 6px 0">Update name</h3>
+            <form method="POST" action="/apps/nuggetdepot/me/name?${qs}">
+              <label for="first_name">First name</label>
+              <input id="first_name" name="first_name" value="${first}" required />
+
+              <label for="last_name">Last name</label>
+              <input id="last_name" name="last_name" value="${last}" required />
+
+              <button class="btn" type="submit">Save name</button>
+            </form>
+
+            <hr/>
+
+            <h3 style="margin:0 0 6px 0">Update profile photo</h3>
+            <form method="POST" enctype="multipart/form-data" action="/apps/nuggetdepot/me/avatar?${qs}">
+              <input type="file" name="avatar" accept="image/png,image/jpeg,image/webp" required />
+              <div class="muted small">Square recommended. Max 2MB. PNG, JPG, or WEBP.</div>
+              <button class="btn" type="submit">Upload photo</button>
+            </form>
+          </div>
         </div>
       `,
       shop
@@ -295,168 +403,55 @@ proxy.get("/me", async (req, res) => {
   );
 });
 
-/**
- * LOGIN / SIGNUP PAGE
- * If already logged in: go straight to feed (or onboarding if missing fields).
- * If not logged in: show Shopify login form + create account link.
- */
-proxy.get("/me/username", async (req, res) => {
+/** Save first/last name */
+proxy.post("/me/name", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   const qs = signedQueryString(req);
 
-  // Already logged in -> redirect to feed OR onboarding
-  if (customerId) {
-    const profile = await getProfile(customerId);
-    const needsOnboarding =
-      !profile?.username || !profile?.full_name || !profile?.dob || !profile?.favorite_pokemon;
+  if (!customerId) return res.status(401).type("text").send("Not logged in");
+  if (!pool) return res.status(500).type("text").send("DB not configured");
 
-    return res.redirect(needsOnboarding ? `/apps/nuggetdepot/onboarding?${qs}` : `/apps/nuggetdepot?${qs}`);
-  }
+  const first_name = cleanText(req.body?.first_name, 40);
+  const last_name = cleanText(req.body?.last_name, 40);
 
-  const returnUrl = "/apps/nuggetdepot";
-  const registerUrl = `/account/register?return_url=${encodeURIComponent("/apps/nuggetdepot/onboarding")}`;
-
-  return res.type("html").send(
-    page(
-      "Log in",
-      `
-        <form method="POST" action="/account/login">
-          <label for="email">Email</label>
-          <input id="email" name="customer[email]" type="email" autocomplete="email" required />
-
-          <label for="password">Password</label>
-          <input id="password" name="customer[password]" type="password" autocomplete="current-password" required />
-
-          <input type="hidden" name="return_url" value="${returnUrl}" />
-
-          <button class="btn" type="submit">Log in</button>
-        </form>
-
-        <hr/>
-
-        <a href="${registerUrl}">Create account</a>
-      `,
-      shop,
-      false
-    )
-  );
-});
-
-/** SIGNUP DETAILS (your custom fields) */
-proxy.get("/onboarding", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-
-  const qs = signedQueryString(req);
-
-  if (!customerId) {
-    return res.type("html").send(
-      page(
-        "Create account",
-        `
-          <p>Please create an account or log in first.</p>
-          <a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>
-          <a class="btn" style="margin-left:8px" href="/account/register?return_url=${encodeURIComponent(
-            "/apps/nuggetdepot/onboarding"
-          )}">Create account</a>
-        `,
-        shop,
-        false
-      )
-    );
-  }
-
-  const profile = await getProfile(customerId);
-
-  const fullName = profile?.full_name || "";
-  const dob = profile?.dob ? String(profile.dob).slice(0, 10) : "";
-  const fav = profile?.favorite_pokemon || "";
-  const username = profile?.username || "";
-
-  const status =
-    req.query.saved === "1"
-      ? `<p class="ok">Saved.</p>`
-      : req.query.err === "1"
-      ? `<p class="error">Please check your inputs.</p>`
-      : req.query.dberr === "1"
-      ? `<p class="error">Could not save. Check Render logs.</p>`
-      : "";
-
-  return res.type("html").send(
-    page(
-      "Create account",
-      `
-        ${status}
-
-        <form method="GET" action="/apps/nuggetdepot/onboarding/save?${qs}">
-          <label for="full_name">Full name</label>
-          <input id="full_name" name="full_name" value="${fullName}" required />
-
-          <label for="dob">DOB</label>
-          <input id="dob" name="dob" type="date" value="${dob}" required />
-
-          <label for="favorite_pokemon">Favorite Pokémon</label>
-          <input id="favorite_pokemon" name="favorite_pokemon" value="${fav}" required />
-
-          <label for="username">New username</label>
-          <input id="username" name="username" value="${username}" placeholder="ex: nuggetking" required />
-          <div class="muted">3–20 characters. Letters, numbers, underscore, dash, dot.</div>
-
-          <button class="btn" type="submit">Enter</button>
-        </form>
-
-        <div class="muted" style="margin-top:10px">
-          Email and password are managed by Shopify. These fields are your community profile.
-        </div>
-      `,
-      shop,
-      false
-    )
-  );
-});
-
-proxy.get("/onboarding/save", async (req, res) => {
-  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  const customerId =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-  const qs = signedQueryString(req);
-
-  if (!customerId) {
-    return res.type("html").send(
-      page(
-        "Create account",
-        `<p>Please log in first.</p><a class="btn" href="/apps/nuggetdepot/me/username?${qs}">Log in</a>`,
-        shop,
-        false
-      )
-    );
-  }
-
-  const full_name = cleanText(req.query.full_name, 80);
-  const favorite_pokemon = cleanText(req.query.favorite_pokemon, 40);
-  const username = cleanUsername(req.query.username);
-  const dob = cleanDob(req.query.dob);
-
-  if (!full_name || !favorite_pokemon || !username || !dob) {
-    return res.redirect(`/apps/nuggetdepot/onboarding?err=1&${qs}`);
-  }
+  if (!first_name || !last_name) return res.redirect(`/apps/nuggetdepot/me?err=1&${qs}`);
 
   try {
-    await upsertProfile(customerId, shop, {
-      full_name,
-      favorite_pokemon,
-      username,
-      dob,
-    });
-
-    return res.redirect(`/apps/nuggetdepot?${qs}`);
+    await ensureRow(customerId, shop);
+    await updateProfile(customerId, { first_name, last_name });
+    return res.redirect(`/apps/nuggetdepot/me?saved=1&${qs}`);
   } catch (e) {
-    console.error("onboarding save error:", e);
-    return res.redirect(`/apps/nuggetdepot/onboarding?dberr=1&${qs}`);
+    console.error("name save error:", e);
+    return res.redirect(`/apps/nuggetdepot/me?err=1&${qs}`);
+  }
+});
+
+/** Upload avatar */
+proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const qs = signedQueryString(req);
+
+  if (!customerId) return res.status(401).type("text").send("Not logged in");
+  if (!pool) return res.status(500).type("text").send("DB not configured");
+
+  const file = req.file;
+  if (!file || !file.buffer || !file.mimetype) return res.redirect(`/apps/nuggetdepot/me?imgerr=1&${qs}`);
+
+  const allowed = new Set(["image/png", "image/jpeg", "image/webp"]);
+  if (!allowed.has(file.mimetype)) return res.redirect(`/apps/nuggetdepot/me?imgerr=1&${qs}`);
+
+  try {
+    await ensureRow(customerId, shop);
+    await updateProfile(customerId, {
+      avatar_bytes: file.buffer,
+      avatar_mime: file.mimetype,
+    });
+    return res.redirect(`/apps/nuggetdepot/me?saved=1&${qs}`);
+  } catch (e) {
+    console.error("avatar upload error:", e);
+    return res.redirect(`/apps/nuggetdepot/me?imgerr=1&${qs}`);
   }
 });
 
