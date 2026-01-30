@@ -53,30 +53,22 @@ async function ensureSchema() {
   `);
 
   // Add fields we need for profile display
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
+
+  // Bio + social link
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`);
 
   // Avatar stored in DB (MVP)
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
 
   // Keep older columns safe (no-op if already present)
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS dob DATE`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`);
 
   // Repair older tables created without defaults (prevents NULL insert failures)
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET DEFAULT ''`);
@@ -84,6 +76,8 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN first_name SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN last_name SET DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN bio SET DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET DEFAULT ''`);
 
   // Backfill any existing NULLs
@@ -92,6 +86,8 @@ async function ensureSchema() {
   await pool.query(`UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET social_url = '' WHERE social_url IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET avatar_mime = '' WHERE avatar_mime IS NULL`);
 
   // Re-assert NOT NULL (in case older schema differed)
@@ -100,6 +96,8 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN first_name SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN last_name SET NOT NULL`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN bio SET NOT NULL`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET NOT NULL`);
 }
 
@@ -131,14 +129,14 @@ function verifyShopifyProxy(req) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function page(title, bodyHtml, shop, nav = true) {
+function page(_title, bodyHtml, shop, nav = true) {
   const safeShop = shop || "unknown";
   return `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>${title}</title>
+    <title>Nugget Depot</title>
     <style>
       body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.35}
       a{color:inherit}
@@ -149,7 +147,8 @@ function page(title, bodyHtml, shop, nav = true) {
       .grid{display:grid;grid-template-columns:180px 1fr;gap:8px 16px;margin-top:12px}
       .k{opacity:.75}
       .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;background:white;cursor:pointer}
-      input{padding:10px 12px;border:1px solid #ddd;border-radius:10px;width:320px;max-width:100%}
+      input, textarea{padding:10px 12px;border:1px solid #ddd;border-radius:10px;width:100%;max-width:520px;font:inherit}
+      textarea{min-height:110px;resize:vertical}
       label{display:block;margin-top:12px;margin-bottom:6px}
       .error{color:#b00020}
       .ok{color:#137333}
@@ -202,6 +201,7 @@ function page(title, bodyHtml, shop, nav = true) {
         justify-content:center;
         cursor:pointer;
         box-shadow:0 2px 10px rgba(0,0,0,.06);
+        text-decoration:none;
       }
       .fileInput{
         position:absolute;
@@ -215,9 +215,11 @@ function page(title, bodyHtml, shop, nav = true) {
         border:0;
       }
 
-      .nameUnder{margin-top:10px;font-weight:700}
-      .subUnder{margin-top:4px}
+      .nameUnder{margin-top:10px;font-weight:800}
+      .handleUnder{margin-top:4px}
       .small{font-size:13px}
+      .stack{width:100%;max-width:520px}
+      .help{margin-top:6px}
     </style>
   </head>
   <body>
@@ -230,7 +232,6 @@ function page(title, bodyHtml, shop, nav = true) {
     </div>
     <hr/>` : ``}
     <div class="card ${nav ? "" : "center"}">
-      <h1>${title}</h1>
       ${bodyHtml}
       <p class="muted">Shop: <code>${safeShop}</code></p>
     </div>
@@ -275,6 +276,10 @@ function cleanText(input, max = 80) {
   return String(input || "").trim().slice(0, max);
 }
 
+function cleanMultiline(input, max = 400) {
+  return String(input || "").replace(/\r\n/g, "\n").trim().slice(0, max);
+}
+
 function initialsFor(first, last) {
   const a = (first || "").trim().slice(0, 1).toUpperCase();
   const b = (last || "").trim().slice(0, 1).toUpperCase();
@@ -293,12 +298,18 @@ function svgAvatar(initials) {
 </svg>`;
 }
 
+function safeHandle(username) {
+  const u = String(username || "").trim();
+  if (!u) return "";
+  return u.startsWith("@") ? u : `@${u}`;
+}
+
 async function getProfile(customerId) {
   if (!pool) return null;
   await ensureSchema();
   const r = await pool.query(
     `SELECT customer_id, shop, username, full_name, dob, favorite_pokemon,
-            first_name, last_name, avatar_mime
+            first_name, last_name, bio, social_url, avatar_mime
      FROM profiles_v2
      WHERE customer_id=$1`,
     [customerId]
@@ -327,9 +338,9 @@ async function ensureRow(customerId, shop) {
     `INSERT INTO profiles_v2 (
         customer_id, shop,
         username, full_name, favorite_pokemon,
-        first_name, last_name, avatar_mime
+        first_name, last_name, bio, social_url, avatar_mime
      )
-     VALUES ($1,$2,'','','','','','')
+     VALUES ($1,$2,'','','','','','','','')
      ON CONFLICT (customer_id)
      DO UPDATE SET shop=EXCLUDED.shop, updated_at=NOW()`,
     [customerId, shop]
@@ -385,7 +396,7 @@ proxy.get("/", async (req, res) => {
   if (!customerId) {
     return res.type("html").send(
       page(
-        "Nugget Depot",
+        "Feed",
         `<p>Please log in to view the community feed.</p>
          <a class="btn" href="/account/login">Log in</a>`,
         shop
@@ -395,7 +406,7 @@ proxy.get("/", async (req, res) => {
 
   return res.type("html").send(
     page(
-      "Community Feed",
+      "Feed",
       `<p>Feed placeholder.</p>
        <p class="muted">Next: posts table, image uploads, likes/comments.</p>`,
       shop
@@ -430,7 +441,7 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
-/** PROFILE PAGE */
+/** PROFILE PAGE (clean header, no titles, no forms) */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -438,9 +449,9 @@ proxy.get("/me", async (req, res) => {
   const qs = signedQueryString(req);
 
   if (!customerId) {
-    return res.type("html").send(
-      page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop)
-    );
+    return res
+      .type("html")
+      .send(page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
   }
 
   if (!pool) {
@@ -456,6 +467,9 @@ proxy.get("/me", async (req, res) => {
   const last = profile?.last_name || "";
   const displayName = `${first} ${last}`.trim() || "Name not set";
 
+  const handle = safeHandle(profile?.username);
+  const handleLine = handle ? `<div class="muted handleUnder">${handle}</div>` : `<div class="muted handleUnder">Username not set</div>`;
+
   const status =
     req.query.saved === "1"
       ? `<p class="ok">Saved.</p>`
@@ -466,6 +480,7 @@ proxy.get("/me", async (req, res) => {
           : "";
 
   const avatarSrc = `/apps/nuggetdepot/me/avatar?${qs}`;
+  const editHref = `/apps/nuggetdepot/me/edit?${qs}`;
 
   return res.type("html").send(
     page(
@@ -473,6 +488,60 @@ proxy.get("/me", async (req, res) => {
       `
         ${status}
 
+        <div class="profileTop">
+          <div class="avatarWrap">
+            <div class="avatarBox">
+              <img class="avatar" src="${avatarSrc}" alt="Profile photo" />
+              <a class="avatarEdit" href="${editHref}" aria-label="Edit profile">✎</a>
+            </div>
+
+            <div class="nameUnder">${displayName}</div>
+            ${handleLine}
+
+            <div class="help small muted" style="margin-top:10px">
+              <a href="${editHref}">Edit profile</a>
+            </div>
+          </div>
+        </div>
+      `,
+      shop
+    )
+  );
+});
+
+/** EDIT BIO PAGE */
+proxy.get("/me/edit", async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const qs = signedQueryString(req);
+
+  if (!customerId) {
+    return res
+      .type("html")
+      .send(page("Edit Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
+  }
+
+  if (!pool) {
+    return res
+      .type("html")
+      .send(page("Edit Profile", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop));
+  }
+
+  await ensureRow(customerId, shop);
+
+  const profile = await getProfile(customerId);
+  const first = profile?.first_name || "";
+  const last = profile?.last_name || "";
+  const bio = profile?.bio || "";
+  const social_url = profile?.social_url || "";
+
+  const avatarSrc = `/apps/nuggetdepot/me/avatar?${qs}`;
+
+  return res.type("html").send(
+    page(
+      "Edit Profile",
+      `
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
@@ -491,24 +560,29 @@ proxy.get("/me", async (req, res) => {
               <button class="avatarEdit" type="button" id="avatarBtn" aria-label="Change profile photo">✎</button>
             </div>
 
-            <div class="nameUnder">${displayName}</div>
-            <div class="muted subUnder small">
-              ${profile?.username ? `@${profile.username}` : `<span class="muted">Username not set</span>`}
-            </div>
+            <div class="help small muted">Tap ✎ to change photo</div>
           </div>
 
-          <div style="min-width:260px;flex:1;width:100%;max-width:520px">
-            <hr/>
-
-            <h3 style="margin:0 0 6px 0">Update name</h3>
-            <form method="POST" action="/apps/nuggetdepot/me/name?${qs}">
+          <div class="stack">
+            <form method="POST" action="/apps/nuggetdepot/me/edit?${qs}">
               <label for="first_name">First name</label>
               <input id="first_name" name="first_name" value="${first}" required />
 
               <label for="last_name">Last name</label>
               <input id="last_name" name="last_name" value="${last}" required />
 
-              <button class="btn" type="submit">Save name</button>
+              <label for="social_url">Social link</label>
+              <input id="social_url" name="social_url" value="${social_url}" placeholder="https://instagram.com/yourname" />
+
+              <label for="bio">Bio</label>
+              <textarea id="bio" name="bio" placeholder="Tell the community about you...">${bio}</textarea>
+
+              <div class="row">
+                <button class="btn" type="submit">Save</button>
+                <a class="btn" href="/apps/nuggetdepot/me?${qs}">Done</a>
+              </div>
+
+              <div class="muted small help">Photo max 2MB. PNG, JPG, or WEBP.</div>
             </form>
           </div>
         </div>
@@ -533,8 +607,8 @@ proxy.get("/me", async (req, res) => {
   );
 });
 
-/** Save first/last name */
-proxy.post("/me/name", async (req, res) => {
+/** Save edit profile fields */
+proxy.post("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
@@ -545,16 +619,18 @@ proxy.post("/me/name", async (req, res) => {
 
   const first_name = cleanText(req.body?.first_name, 40);
   const last_name = cleanText(req.body?.last_name, 40);
+  const social_url = cleanText(req.body?.social_url, 220);
+  const bio = cleanMultiline(req.body?.bio, 500);
 
-  if (!first_name || !last_name) return res.redirect(`/apps/nuggetdepot/me?err=1&${qs}`);
+  if (!first_name || !last_name) return res.redirect(`/apps/nuggetdepot/me/edit?err=1&${qs}`);
 
   try {
     await ensureRow(customerId, shop);
-    await updateProfile(customerId, { first_name, last_name });
+    await updateProfile(customerId, { first_name, last_name, social_url, bio });
     return res.redirect(`/apps/nuggetdepot/me?saved=1&${qs}`);
   } catch (e) {
-    console.error("name save error:", e);
-    return res.redirect(`/apps/nuggetdepot/me?err=1&${qs}`);
+    console.error("edit save error:", e);
+    return res.redirect(`/apps/nuggetdepot/me/edit?err=1&${qs}`);
   }
 });
 
@@ -568,20 +644,20 @@ proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
   if (!pool) return res.status(200).type("text").send("DB not configured");
 
   const file = req.file;
-  if (!file || !file.buffer || !file.mimetype) return res.redirect(`/apps/nuggetdepot/me?imgerr=1&${qs}`);
+  if (!file || !file.buffer || !file.mimetype) return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
 
   const allowed = new Set(["image/png", "image/jpeg", "image/webp"]);
-  if (!allowed.has(file.mimetype)) return res.redirect(`/apps/nuggetdepot/me?imgerr=1&${qs}`);
+  if (!allowed.has(file.mimetype)) return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
 
   try {
     await updateProfile(customerId, {
       avatar_bytes: file.buffer,
       avatar_mime: file.mimetype,
     });
-    return res.redirect(`/apps/nuggetdepot/me?saved=1&${qs}`);
+    return res.redirect(`/apps/nuggetdepot/me/edit?saved=1&${qs}`);
   } catch (e) {
     console.error("avatar upload error:", e);
-    return res.redirect(`/apps/nuggetdepot/me?imgerr=1&${qs}`);
+    return res.redirect(`/apps/nuggetdepot/me/edit?imgerr=1&${qs}`);
   }
 });
 
