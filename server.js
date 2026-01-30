@@ -11,10 +11,6 @@ app.use((req, res, next) => {
 });
 
 const SHOPIFY_API_SECRET = (process.env.SHOPIFY_API_SECRET || "").trim();
-const SHOPIFY_ADMIN_ACCESS_TOKEN = (process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || "").trim();
-const SHOPIFY_SHOP_DOMAIN = (process.env.SHOPIFY_SHOP_DOMAIN || "").trim();
-const SHOPIFY_API_VERSION = (process.env.SHOPIFY_API_VERSION || "2026-01").trim();
-
 const PORT = Number(process.env.PORT) || 3000;
 
 function buildProxyMessage(query) {
@@ -32,7 +28,6 @@ function verifyShopifyProxy(req) {
   if (!SHOPIFY_API_SECRET) return false;
 
   const query = { ...req.query };
-
   const signature = typeof query.signature === "string" ? query.signature : "";
   if (!signature) return false;
 
@@ -55,6 +50,7 @@ function requireProxyAuth(req, res, next) {
 }
 
 function page(title, bodyHtml, shop) {
+  const safeShop = shop || "unknown";
   return `<!doctype html>
 <html>
   <head>
@@ -84,38 +80,13 @@ function page(title, bodyHtml, shop) {
     <div class="card">
       <h1>${title}</h1>
       ${bodyHtml}
-      <p class="muted">Shop: <code>${shop || "unknown"}</code></p>
+      <p class="muted">Shop: <code>${safeShop}</code></p>
     </div>
   </body>
 </html>`;
 }
 
-async function shopifyGraphQL({ query, variables }) {
-  if (!SHOPIFY_SHOP_DOMAIN) throw new Error("Missing SHOPIFY_SHOP_DOMAIN");
-  if (!SHOPIFY_ADMIN_ACCESS_TOKEN) throw new Error("Missing SHOPIFY_ADMIN_ACCESS_TOKEN");
-
-  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = await resp.json().catch(() => ({}));
-
-  if (!resp.ok) {
-    throw new Error(`Shopify Admin API HTTP ${resp.status}: ${JSON.stringify(json)}`);
-  }
-  if (json.errors?.length) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  }
-  return json.data;
-}
-
-// Root page (Render)
+// Root page (Render URL)
 app.get("/", (req, res) => {
   res.type("html").send(`
     <h1>Nugget Depot</h1>
@@ -145,75 +116,67 @@ proxy.get("/", (req, res) => {
   );
 });
 
-// My Profile (functional)
-proxy.get("/me", async (req, res) => {
+// My Profile (functional without Admin API: shows login state + lets you set a username later)
+proxy.get("/me", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const loggedInCustomerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
-  // If customer not logged in, Shopify sets this blank. :contentReference[oaicite:1]{index=1}
   if (!loggedInCustomerId) {
     return res.type("html").send(
       page(
         "My Profile",
-        `
-          <p>You are not logged in.</p>
-          <a class="btn" href="/account/login">Log in</a>
-        `,
+        `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`,
         shop
       )
     );
   }
 
-  try {
-    const data = await shopifyGraphQL({
-      query: `
-        query GetCustomer($id: ID!) {
-          customer(id: $id) {
-            id
-            firstName
-            lastName
-            email
-            phone
-            createdAt
-            defaultAddress {
-              city
-              province
-              country
-            }
-            metafield(namespace: "nuggetdepot", key: "username") {
-              value
-            }
-          }
-        }
+  return res.type("html").send(
+    page(
+      "My Profile",
+      `
+        <p>Logged in.</p>
+        <div class="grid">
+          <div class="k">Customer ID</div><div><code>${loggedInCustomerId}</code></div>
+        </div>
+        <h2 style="margin-top:18px">Next</h2>
+        <ul>
+          <li>Save a username (stored in our DB keyed to your customer ID)</li>
+          <li>Show your collection count</li>
+          <li>Show your trade listings</li>
+        </ul>
       `,
-      variables: { id: `gid://shopify/Customer/${loggedInCustomerId}` },
-    });
+      shop
+    )
+  );
+});
 
-    const c = data?.customer;
-    if (!c) {
-      return res.status(404).type("html").send(
-        page(
-          "My Profile",
-          `<p>Customer not found for this session.</p>`,
-          shop
-        )
-      );
-    }
+proxy.get("/collection", (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  res.type("html").send(page("My Collection", `<p>Next: saved cards, grades, notes.</p>`, shop));
+});
 
-    const username =
-      (c.metafield?.value || "").trim() ||
-      [c.firstName, c.lastName].filter(Boolean).join(" ").trim() ||
-      `Trainer ${String(loggedInCustomerId).slice(-4)}`;
+proxy.get("/trades", (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  res.type("html").send(page("Trades", `<p>Next: listings, offers, messages.</p>`, shop));
+});
 
-    const address = c.defaultAddress
-      ? [c.defaultAddress.city, c.defaultAddress.province, c.defaultAddress.country]
-          .filter(Boolean)
-          .join(", ")
-      : "";
+app.use("/proxy", proxy);
 
-    return res.type("html").send(
-      page(
-        "My Profile",
-        `
-          <p>Welcome, <strong>${username}</strong>.</p>
+// 404 fallback
+app.use((req, res) => res.status(404).type("text").send("Not found"));
+
+// Ensure Render sees a bound port
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server listening on 0.0.0.0:${PORT}`);
+});
+
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received, shutting down...");
+  server.close(() => process.exit(0));
+});
+process.on("SIGINT", () => {
+  console.log("SIGINT received, shutting down...");
+  server.close(() => process.exit(0)
