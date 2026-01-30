@@ -107,13 +107,9 @@ proxy.use(requireProxyAuth);
 
 proxy.get("/", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(
-    page(
-      "Nugget Depot",
-      `<p>Proxy working.</p><p>Use the navigation above.</p>`,
-      shop
-    )
-  );
+  res
+    .type("html")
+    .send(page("Nugget Depot", `<p>Proxy working.</p><p>Use the navigation above.</p>`, shop));
 });
 
 // My Profile (functional without Admin API: shows login state + lets you set a username later)
@@ -123,13 +119,9 @@ proxy.get("/me", (req, res) => {
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
 
   if (!loggedInCustomerId) {
-    return res.type("html").send(
-      page(
-        "My Profile",
-        `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`,
-        shop
-      )
-    );
+    return res
+      .type("html")
+      .send(page("My Profile", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop));
   }
 
   return res.type("html").send(
@@ -177,6 +169,8 @@ process.on("SIGTERM", () => {
   console.log("SIGTERM received, shutting down...");
   server.close(() => process.exit(0));
 });
+
 process.on("SIGINT", () => {
   console.log("SIGINT received, shutting down...");
-  server.close(() => process.exit(0)
+  server.close(() => process.exit(0));
+});
