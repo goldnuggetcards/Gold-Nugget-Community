@@ -1,10 +1,14 @@
 // server.js (FULL FILE REPLACEMENT)
-// Goal: keep it simple and make navigation work reliably.
-// - Clicking the edit icon on /me goes to /me/edit
-// - Clicking Done on /me/edit goes back to /me
-// Implementation detail:
-// - Do NOT carry forward the signed querystring in links/forms/images
-// - Use Shopify’s `path_prefix` to build links (falls back to /apps/nuggetdepot)
+// Adds posting MVP:
+// - Post entry point visible ONLY on /me (your own profile)
+// - Clicking the box or media button goes to /post/new (more space)
+// - 500 character max
+// - Optional media (photo or video)
+// - Send creates post and redirects back to /me
+// - Public profile route /u/:customerId does NOT show the post box
+// Notes:
+// - Links/forms do NOT carry signed querystring
+// - Uses Shopify path_prefix when available
 
 import express from "express";
 import crypto from "crypto";
@@ -36,14 +40,21 @@ const pool = DATABASE_URL
     })
   : null;
 
-const upload = multer({
+// Uploaders
+const uploadAvatar = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+});
+
+const uploadPostMedia = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB (MVP)
 });
 
 async function ensureSchema() {
   if (!pool) return;
 
+  // Profiles
   await pool.query(`
     CREATE TABLE IF NOT EXISTS profiles_v2 (
       customer_id TEXT PRIMARY KEY,
@@ -62,20 +73,18 @@ async function ensureSchema() {
   await pool.query(
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
   );
-
   await pool.query(
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`
   );
   await pool.query(
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
   );
-
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
   await pool.query(
     `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
   );
 
-  // Backfill NULLs for older schemas
+  // Backfill NULLs
   await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
   await pool.query(
@@ -105,6 +114,32 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN bio SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET NOT NULL`);
   await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET NOT NULL`);
+
+  // Posts
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS posts_v1 (
+      id BIGSERIAL PRIMARY KEY,
+      shop TEXT NOT NULL,
+      customer_id TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      media_bytes BYTEA,
+      media_mime TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET DEFAULT ''`);
+  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET DEFAULT ''`);
+
+  await pool.query(`UPDATE posts_v1 SET body = '' WHERE body IS NULL`);
+  await pool.query(`UPDATE posts_v1 SET media_mime = '' WHERE media_mime IS NULL`);
+
+  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET NOT NULL`);
+  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET NOT NULL`);
+
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS posts_v1_customer_created_idx ON posts_v1 (customer_id, created_at DESC)`
+  );
 }
 
 function buildProxyMessage(query) {
@@ -140,9 +175,9 @@ function basePathFromReq(req) {
   return p && p.startsWith("/") ? p : "/apps/nuggetdepot";
 }
 
-function page(_title, bodyHtml, shop, nav = true, reqForBase = null) {
+function page(bodyHtml, shop, reqForBase) {
   const safeShop = shop || "unknown";
-  const base = reqForBase ? basePathFromReq(reqForBase) : "/apps/nuggetdepot";
+  const base = basePathFromReq(reqForBase);
 
   return `<!doctype html>
 <html>
@@ -158,8 +193,8 @@ function page(_title, bodyHtml, shop, nav = true, reqForBase = null) {
       code{background:#f5f5f5;padding:2px 6px;border-radius:6px}
       .muted{opacity:.75}
       .btn{display:inline-block;margin-top:12px;padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;background:white;cursor:pointer}
-      input, textarea{padding:10px 12px;border:1px solid #ddd;border-radius:10px;width:100%;max-width:520px;font:inherit}
-      textarea{min-height:110px;resize:vertical}
+      input, textarea{padding:10px 12px;border:1px solid #ddd;border-radius:10px;width:100%;max-width:720px;font:inherit}
+      textarea{min-height:160px;resize:vertical}
       label{display:block;margin-top:12px;margin-bottom:6px}
       .error{color:#b00020}
       .ok{color:#137333}
@@ -175,19 +210,60 @@ function page(_title, bodyHtml, shop, nav = true, reqForBase = null) {
       .nameUnder{margin-top:10px;font-weight:800}
       .handleUnder{margin-top:4px}
       .small{font-size:13px}
-      .stack{width:100%;max-width:520px}
+      .stack{width:100%;max-width:720px}
       .help{margin-top:6px}
+
+      .composer{
+        width:100%;
+        max-width:720px;
+        border:1px solid #eee;
+        border-radius:12px;
+        padding:12px;
+        margin-top:14px;
+        background:#fff;
+      }
+      .composerTop{display:flex;gap:10px;align-items:center}
+      .composerFake{
+        flex:1;
+        border:1px solid #ddd;
+        border-radius:10px;
+        padding:10px 12px;
+        text-decoration:none;
+        background:#fafafa;
+      }
+      .iconBtn{
+        border:1px solid #ddd;
+        border-radius:10px;
+        width:44px;
+        height:44px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        text-decoration:none;
+        background:#fff;
+      }
+
+      .postList{width:100%;max-width:720px;margin-top:14px}
+      .postItem{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:10px}
+      .postMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+      .media{
+        width:100%;
+        max-width:100%;
+        border-radius:12px;
+        border:1px solid #eee;
+        margin-top:10px;
+        background:#fafafa;
+      }
     </style>
   </head>
   <body>
-    ${nav ? `
     <div class="nav">
       <a href="${base}">Feed</a>
       <a href="${base}/me">My Profile</a>
       <a href="${base}/collection">My Collection</a>
       <a href="${base}/trades">Trades</a>
     </div>
-    <hr/>` : ``}
+    <hr/>
     <div class="card">
       ${bodyHtml}
       <p class="muted">Shop: <code>${safeShop}</code></p>
@@ -203,21 +279,19 @@ function requireProxyAuth(req, res, next) {
     return res
       .status(200)
       .type("html")
-      .send(page("", `<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop, true, req));
+      .send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, shop, req));
   }
 
   if (!verifyShopifyProxy(req)) {
     const keys = Object.keys(req.query || {}).sort().join(", ");
     return res.status(200).type("html").send(
       page(
-        "",
         `
           <p class="error">Invalid proxy signature.</p>
           <p class="muted">Path: <code>${req.originalUrl}</code></p>
           <p class="muted">Query keys: <code>${keys || "none"}</code></p>
         `,
         shop,
-        true,
         req
       )
     );
@@ -230,7 +304,10 @@ function cleanText(input, max = 80) {
   return String(input || "").trim().slice(0, max);
 }
 function cleanMultiline(input, max = 400) {
-  return String(input || "").replace(/\r\n/g, "\n").trim().slice(0, max);
+  return String(input || "")
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .slice(0, max);
 }
 function initialsFor(first, last) {
   const a = (first || "").trim().slice(0, 1).toUpperCase();
@@ -252,6 +329,14 @@ function safeHandle(username) {
   const u = String(username || "").trim();
   if (!u) return "";
   return u.startsWith("@") ? u : `@${u}`;
+}
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 async function getProfile(customerId) {
@@ -318,6 +403,43 @@ async function updateProfile(customerId, patch) {
   );
 }
 
+async function createPost({ shop, customerId, body, mediaBytes, mediaMime }) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
+
+  const r = await pool.query(
+    `INSERT INTO posts_v1 (shop, customer_id, body, media_bytes, media_mime)
+     VALUES ($1,$2,$3,$4,$5)
+     RETURNING id`,
+    [shop, customerId, body || "", mediaBytes || null, mediaMime || ""]
+  );
+  return r.rows?.[0]?.id || null;
+}
+
+async function listPostsForCustomer(customerId, limit = 20) {
+  if (!pool) return [];
+  await ensureSchema();
+  const r = await pool.query(
+    `SELECT id, body, media_mime, created_at
+     FROM posts_v1
+     WHERE customer_id=$1
+     ORDER BY created_at DESC
+     LIMIT $2`,
+    [customerId, limit]
+  );
+  return r.rows || [];
+}
+
+async function getPostMedia(postId) {
+  if (!pool) return null;
+  await ensureSchema();
+  const r = await pool.query(
+    `SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`,
+    [postId]
+  );
+  return r.rows?.[0] || null;
+}
+
 /** Non-proxy root */
 app.get("/", (req, res) => {
   res.type("html").send(`
@@ -335,7 +457,7 @@ app.get("/healthz", (req, res) => res.status(200).type("text").send("ok"));
 const proxy = express.Router();
 proxy.use(requireProxyAuth);
 
-/** Feed */
+/** Feed (placeholder) */
 proxy.get("/", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -344,10 +466,10 @@ proxy.get("/", async (req, res) => {
   if (!customerId) {
     return res
       .type("html")
-      .send(page("", `<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req));
+      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
   }
 
-  return res.type("html").send(page("", `<p>Feed placeholder.</p>`, shop, true, req));
+  return res.type("html").send(page(`<p>Feed placeholder.</p>`, shop, req));
 });
 
 /** Avatar */
@@ -376,7 +498,30 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
-/** My Profile */
+/** Post media */
+proxy.get("/posts/:id/media", async (req, res) => {
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
+
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(404).type("text").send("Not found");
+
+  try {
+    const m = await getPostMedia(id);
+    if (!m?.media_bytes || !m?.media_mime) return res.status(404).type("text").send("Not found");
+
+    res.setHeader("Content-Type", m.media_mime);
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(m.media_bytes);
+  } catch (e) {
+    console.error("post media error:", e);
+    return res.status(200).type("text").send("Media error");
+  }
+});
+
+/** My Profile (shows post box ONLY here) */
 proxy.get("/me", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -386,12 +531,12 @@ proxy.get("/me", async (req, res) => {
   if (!customerId) {
     return res
       .type("html")
-      .send(page("", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req));
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
   }
   if (!pool) {
     return res
       .type("html")
-      .send(page("", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, true, req));
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, req));
   }
 
   await ensureRow(customerId, shop);
@@ -402,15 +547,49 @@ proxy.get("/me", async (req, res) => {
 
   const handle = safeHandle(profile?.username);
   const handleLine = handle
-    ? `<div class="muted handleUnder">${handle}</div>`
+    ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
     : `<div class="muted handleUnder">Username not set</div>`;
 
   const avatarSrc = `${base}/me/avatar`;
   const editHref = `${base}/me/edit`;
+  const newPostHref = `${base}/post/new`;
+
+  const posts = await listPostsForCustomer(customerId, 20);
+
+  const postsHtml =
+    posts.length === 0
+      ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
+      : `<div class="postList">
+          ${posts
+            .map((p) => {
+              const body = escapeHtml(p.body || "");
+              const hasMedia = !!(p.media_mime && p.media_mime.trim());
+              const isVideo = hasMedia && p.media_mime.startsWith("video/");
+              const mediaUrl = `${base}/posts/${p.id}/media`;
+
+              const mediaHtml = !hasMedia
+                ? ""
+                : isVideo
+                  ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
+                  : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
+
+              const when = new Date(p.created_at).toLocaleString();
+
+              return `
+                <div class="postItem">
+                  <div class="postMeta">
+                    <span class="muted small">${escapeHtml(when)}</span>
+                  </div>
+                  ${body ? `<p style="margin:10px 0 0 0;white-space:pre-wrap">${body}</p>` : ""}
+                  ${mediaHtml}
+                </div>
+              `;
+            })
+            .join("")}
+        </div>`;
 
   return res.type("html").send(
     page(
-      "",
       `
         <div class="profileTop">
           <div class="avatarWrap">
@@ -419,19 +598,252 @@ proxy.get("/me", async (req, res) => {
               <a class="avatarEdit" href="${editHref}" aria-label="Edit profile">✎</a>
             </div>
 
-            <div class="nameUnder">${displayName}</div>
+            <div class="nameUnder">${escapeHtml(displayName)}</div>
             ${handleLine}
+
+            <div class="composer">
+              <div class="composerTop">
+                <a class="composerFake" href="${newPostHref}">Share something...</a>
+                <a class="iconBtn" href="${newPostHref}" aria-label="Add photo or video">＋</a>
+              </div>
+              <div class="muted small help">500 characters max. Media optional.</div>
+            </div>
+
+            ${postsHtml}
           </div>
         </div>
       `,
       shop,
-      true,
       req
     )
   );
 });
 
-/** Edit */
+/** Public profile: /u/:customerId (no post box) */
+proxy.get("/u/:customerId", async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const viewerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const base = basePathFromReq(req);
+
+  const targetId = String(req.params.customerId || "").trim();
+  if (!targetId) return res.type("html").send(page(`<p class="error">Missing user.</p>`, shop, req));
+
+  if (viewerId && targetId === viewerId) {
+    return res.redirect(`${base}/me`);
+  }
+
+  if (!viewerId) {
+    return res
+      .type("html")
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
+  }
+  if (!pool) {
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, req));
+  }
+
+  const profile = await getProfile(targetId);
+  if (!profile) {
+    return res.type("html").send(page(`<p class="error">User not found.</p>`, shop, req));
+  }
+
+  const displayName =
+    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const handle = safeHandle(profile?.username);
+  const handleLine = handle
+    ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
+    : `<div class="muted handleUnder">Username not set</div>`;
+
+  // Avatar endpoint currently only supports "me", so use initials fallback for public view for now.
+  // If you want public avatars, add /avatar/:customerId endpoint later.
+  const ini = initialsFor(profile?.first_name || "", profile?.last_name || "");
+  const avatarSvg = svgAvatar(ini);
+
+  const posts = await listPostsForCustomer(targetId, 20);
+  const postsHtml =
+    posts.length === 0
+      ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
+      : `<div class="postList">
+          ${posts
+            .map((p) => {
+              const body = escapeHtml(p.body || "");
+              const hasMedia = !!(p.media_mime && p.media_mime.trim());
+              const isVideo = hasMedia && p.media_mime.startsWith("video/");
+              const mediaUrl = `${base}/posts/${p.id}/media`;
+              const mediaHtml = !hasMedia
+                ? ""
+                : isVideo
+                  ? `<video class="media" controls playsinline src="${mediaUrl}"></video>`
+                  : `<img class="media" src="${mediaUrl}" alt="Post media" />`;
+              const when = new Date(p.created_at).toLocaleString();
+
+              return `
+                <div class="postItem">
+                  <div class="postMeta">
+                    <span class="muted small">${escapeHtml(when)}</span>
+                  </div>
+                  ${body ? `<p style="margin:10px 0 0 0;white-space:pre-wrap">${body}</p>` : ""}
+                  ${mediaHtml}
+                </div>
+              `;
+            })
+            .join("")}
+        </div>`;
+
+  return res.type("html").send(
+    page(
+      `
+        <div class="profileTop">
+          <div class="avatarWrap">
+            <div class="avatarBox">
+              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+                avatarSvg
+              )}" alt="Profile photo" />
+            </div>
+
+            <div class="nameUnder">${escapeHtml(displayName)}</div>
+            ${handleLine}
+
+            ${postsHtml}
+          </div>
+        </div>
+      `,
+      shop,
+      req
+    )
+  );
+});
+
+/** New post page */
+proxy.get("/post/new", async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const base = basePathFromReq(req);
+
+  if (!customerId) {
+    return res
+      .type("html")
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
+  }
+  if (!pool) {
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, req));
+  }
+
+  const status =
+    req.query.err === "1"
+      ? `<p class="error">Add text or media.</p>`
+      : req.query.toobig === "1"
+        ? `<p class="error">Media too large. Max 15MB.</p>`
+        : req.query.type === "1"
+          ? `<p class="error">Unsupported file type.</p>`
+          : "";
+
+  const postAction = `${base}/post/new`;
+  const cancelHref = `${base}/me`;
+
+  return res.type("html").send(
+    page(
+      `
+        ${status}
+        <div class="stack">
+          <form method="POST" enctype="multipart/form-data" action="${postAction}">
+            <label for="body">Post</label>
+            <textarea id="body" name="body" maxlength="500" placeholder="Write your post (max 500 characters)"></textarea>
+            <div class="muted small help">0 to 500 characters.</div>
+
+            <label for="media">Photo or video</label>
+            <input id="media" type="file" name="media" accept="image/*,video/*" />
+
+            <div class="row">
+              <button class="btn" type="submit" id="sendBtn">Send</button>
+              <a class="btn" href="${cancelHref}">Cancel</a>
+            </div>
+
+            <div class="muted small help">Media max 15MB.</div>
+          </form>
+        </div>
+
+        <script>
+          (function(){
+            const ta = document.getElementById('body');
+            const btn = document.getElementById('sendBtn');
+            function update(){
+              const hasText = ta && ta.value && ta.value.trim().length > 0;
+              btn.disabled = !hasText;
+              btn.style.opacity = btn.disabled ? '0.5' : '1';
+              btn.style.cursor = btn.disabled ? 'not-allowed' : 'pointer';
+            }
+            if (ta && btn) {
+              ta.addEventListener('input', update);
+              update();
+            }
+          })();
+        </script>
+      `,
+      shop,
+      req
+    )
+  );
+});
+
+/** Create post */
+proxy.post("/post/new", uploadPostMedia.single("media"), async (req, res) => {
+  const shop = typeof req.query.shop === "string" ? req.query.shop : "";
+  const customerId =
+    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const base = basePathFromReq(req);
+
+  if (!customerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
+
+  const body = cleanMultiline(req.body?.body, 500);
+
+  const file = req.file;
+  let mediaBytes = null;
+  let mediaMime = "";
+
+  if (file && file.buffer && file.mimetype) {
+    const allowed = new Set([
+      "image/png",
+      "image/jpeg",
+      "image/webp",
+      "image/gif",
+      "video/mp4",
+      "video/webm",
+      "video/quicktime",
+    ]);
+
+    if (!allowed.has(file.mimetype)) {
+      return res.redirect(`${base}/post/new?type=1`);
+    }
+
+    mediaBytes = file.buffer;
+    mediaMime = file.mimetype;
+  }
+
+  const hasText = !!(body && body.trim());
+  const hasMedia = !!mediaBytes;
+
+  if (!hasText && !hasMedia) {
+    return res.redirect(`${base}/post/new?err=1`);
+  }
+
+  try {
+    await ensureRow(customerId, shop);
+    await createPost({ shop, customerId, body, mediaBytes, mediaMime });
+    return res.redirect(`${base}/me`);
+  } catch (e) {
+    console.error("create post error:", e);
+    return res.redirect(`${base}/post/new?err=1`);
+  }
+});
+
+/** Edit profile (existing) */
 proxy.get("/me/edit", async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
@@ -441,12 +853,12 @@ proxy.get("/me/edit", async (req, res) => {
   if (!customerId) {
     return res
       .type("html")
-      .send(page("", `<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, true, req));
+      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, shop, req));
   }
   if (!pool) {
     return res
       .type("html")
-      .send(page("", `<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, true, req));
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, shop, req));
   }
 
   await ensureRow(customerId, shop);
@@ -464,7 +876,6 @@ proxy.get("/me/edit", async (req, res) => {
 
   return res.type("html").send(
     page(
-      "",
       `
         <div class="profileTop">
           <div class="avatarWrap">
@@ -490,16 +901,20 @@ proxy.get("/me/edit", async (req, res) => {
           <div class="stack">
             <form method="POST" action="${saveAction}">
               <label for="first_name">First name</label>
-              <input id="first_name" name="first_name" value="${first}" required />
+              <input id="first_name" name="first_name" value="${escapeHtml(first)}" required />
 
               <label for="last_name">Last name</label>
-              <input id="last_name" name="last_name" value="${last}" required />
+              <input id="last_name" name="last_name" value="${escapeHtml(last)}" required />
 
               <label for="social_url">Social link</label>
-              <input id="social_url" name="social_url" value="${social_url}" placeholder="https://instagram.com/yourname" />
+              <input id="social_url" name="social_url" value="${escapeHtml(
+                social_url
+              )}" placeholder="https://instagram.com/yourname" />
 
               <label for="bio">Bio</label>
-              <textarea id="bio" name="bio" placeholder="Tell the community about you...">${bio}</textarea>
+              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(
+                bio
+              )}</textarea>
 
               <div class="row">
                 <button class="btn" type="submit">Save</button>
@@ -527,7 +942,6 @@ proxy.get("/me/edit", async (req, res) => {
         </script>
       `,
       shop,
-      true,
       req
     )
   );
@@ -547,8 +961,6 @@ proxy.post("/me/edit", async (req, res) => {
   const social_url = cleanText(req.body?.social_url, 220);
   const bio = cleanMultiline(req.body?.bio, 500);
 
-  if (!first_name || !last_name) return res.redirect(`${base}/me/edit`);
-
   try {
     await ensureRow(customerId, shop);
     await updateProfile(customerId, { first_name, last_name, social_url, bio });
@@ -559,7 +971,7 @@ proxy.post("/me/edit", async (req, res) => {
   }
 });
 
-proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
+proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
   const customerId =
     typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
@@ -586,12 +998,12 @@ proxy.post("/me/avatar", upload.single("avatar"), async (req, res) => {
 
 proxy.get("/collection", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(page("", `<p>Collection placeholder.</p>`, shop, true, req));
+  res.type("html").send(page(`<p>Collection placeholder.</p>`, shop, req));
 });
 
 proxy.get("/trades", (req, res) => {
   const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-  res.type("html").send(page("", `<p>Trades placeholder.</p>`, shop, true, req));
+  res.type("html").send(page(`<p>Trades placeholder.</p>`, shop, req));
 });
 
 app.use("/proxy", proxy);
