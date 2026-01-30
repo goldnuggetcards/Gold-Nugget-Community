@@ -8,8 +8,10 @@
 // - Uses signed-cookie session so links stay clean (no signed querystring in URLs)
 // - Removes "Shop: ..." from all pages
 // UPDATE:
-// - Comment rows show a tiny profile picture next to the commenter name (slightly larger than name text)
+// - Comment rows show larger profile picture next to the commenter name (2.5x previous)
 //   Uses /proxy/avatar/:customerId (requires login) with safe fallback to SVG initials.
+// - Post header shows profile picture next to the post author name (same sizing as comments)
+// - Comment text starts aligned under the commenter's name (not near the profile pic)
 // - Feed top shows Gold Nugget logo (half-size)
 // - Prevent HTML caching (no 304s for proxy pages)
 // - Server logs do not include querystring (hides proxy signature noise)
@@ -77,27 +79,17 @@ async function ensureSchema() {
     );
   `);
 
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
 
   // Backfill NULLs
   await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
-  await pool.query(
-    `UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`
-  );
+  await pool.query(`UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
@@ -177,9 +169,7 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET DEFAULT ''`);
   await pool.query(`UPDATE comments_v1 SET body = '' WHERE body IS NULL`);
   await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET NOT NULL`);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS comments_v1_post_created_idx ON comments_v1 (post_id, created_at ASC)`
-  );
+  await pool.query(`CREATE INDEX IF NOT EXISTS comments_v1_post_created_idx ON comments_v1 (post_id, created_at ASC)`);
 }
 
 /* ---------------------------
@@ -236,11 +226,7 @@ function parseCookies(req) {
 
 function b64urlEncode(input) {
   const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input), "utf8");
-  return buf
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
+  return buf.toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
 
 function b64urlDecodeToString(s) {
@@ -323,8 +309,7 @@ function basePathFromReq(req) {
 }
 
 function getViewerCustomerId(req) {
-  const q =
-    typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+  const q = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
   if (q) return q;
 
   const cookies = parseCookies(req);
@@ -511,9 +496,32 @@ function page(bodyHtml, reqForBase) {
 
       .postList{width:100%;max-width:720px;margin-top:14px}
       .postItem{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:10px;background:#fff}
-      .postHeader{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:flex-start}
+
+      /* Post header with author avatar */
+      .postHeader{
+        display:flex;
+        justify-content:space-between;
+        gap:10px;
+        flex-wrap:wrap;
+        align-items:flex-start
+      }
+      .postAuthorRow{
+        display:flex;
+        align-items:center;
+        gap:10px;
+      }
+      .postAuthorAvatar{
+        width:45px;          /* 18px * 2.5 = 45px */
+        height:45px;
+        border-radius:14px;
+        object-fit:cover;
+        border:1px solid #eee;
+        background:#fafafa;
+        flex:0 0 auto;
+      }
       .postAuthor{font-weight:800}
       .postMetaRight{display:flex;gap:10px;align-items:center}
+
       .media{
         width:100%;
         max-width:100%;
@@ -532,23 +540,32 @@ function page(bodyHtml, reqForBase) {
       }
       .actionBtn.liked{border-color:#111}
       .commentBox{margin-top:10px}
+
       .commentItem{border-top:1px solid #f0f0f0;padding-top:8px;margin-top:8px}
-      .commentHead{
+
+      /* Comment layout: avatar left, text block right. Text block aligns under name */
+      .commentRow{
         display:flex;
-        align-items:center;
-        gap:8px;
-        line-height:1.1;
+        gap:10px;
+        align-items:flex-start;
       }
       .commentAvatar{
-        width:18px;
-        height:18px;
-        border-radius:6px;
+        width:45px;          /* 18px * 2.5 = 45px */
+        height:45px;
+        border-radius:14px;
         object-fit:cover;
         border:1px solid #eee;
         background:#fafafa;
         flex:0 0 auto;
+        margin-top:1px;
       }
-      .commentAuthor{font-weight:700}
+      .commentBody{
+        flex:1;
+        min-width:0;
+      }
+      .commentAuthor{font-weight:700; line-height:1.1}
+      .commentText{white-space:pre-wrap; margin-top:4px}
+
       .divider{height:1px;background:#eee;margin:12px 0}
 
       @media (max-width: 520px){
@@ -577,18 +594,13 @@ function page(bodyHtml, reqForBase) {
 
 function requireProxyAuth(req, res, next) {
   if (!SHOPIFY_API_SECRET) {
-    return res
-      .status(200)
-      .type("html")
-      .send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, req));
+    return res.status(200).type("html").send(page(`<p class="error">Missing SHOPIFY_API_SECRET</p>`, req));
   }
 
   if (verifyShopifyProxy(req)) {
     const shop = typeof req.query.shop === "string" ? req.query.shop : "";
-    const customerId =
-      typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
-    const pathPrefix =
-      typeof req.query.path_prefix === "string" ? req.query.path_prefix : "/apps/nuggetdepot";
+    const customerId = typeof req.query.logged_in_customer_id === "string" ? req.query.logged_in_customer_id : "";
+    const pathPrefix = typeof req.query.path_prefix === "string" ? req.query.path_prefix : "/apps/nuggetdepot";
     if (shop && customerId && pathPrefix) {
       setAuthCookie(res, { shop, customer_id: customerId, path_prefix: pathPrefix });
     }
@@ -689,10 +701,7 @@ async function updateProfile(customerId, patch) {
   }
   vals.push(customerId);
 
-  await pool.query(
-    `UPDATE profiles_v2 SET ${sets.join(", ")}, updated_at=NOW() WHERE customer_id=$${i}`,
-    vals
-  );
+  await pool.query(`UPDATE profiles_v2 SET ${sets.join(", ")}, updated_at=NOW() WHERE customer_id=$${i}`, vals);
 }
 
 async function createPost({ shop, customerId, body, mediaBytes, mediaMime }) {
@@ -735,13 +744,10 @@ async function listPostsForCustomerWithMeta({ targetCustomerId, viewerCustomerId
 
   const posts = r.rows || [];
   const postIds = posts.map((x) => Number(x.id)).filter((x) => Number.isFinite(x));
-
   const meta = await getPostsMeta(postIds, viewerCustomerId);
 
   const nextCursor =
-    posts.length === limit
-      ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id)
-      : "";
+    posts.length === limit ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id) : "";
 
   return { posts: posts.map((p) => ({ ...p, ...meta.byPostId[p.id] })), nextCursor };
 }
@@ -777,9 +783,7 @@ async function listFeedPostsWithMeta({ shop, viewerCustomerId, limit = 20, curso
   const meta = await getPostsMeta(postIds, viewerCustomerId);
 
   const nextCursor =
-    posts.length === limit
-      ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id)
-      : "";
+    posts.length === limit ? encodeCursor(posts[posts.length - 1].created_at, posts[posts.length - 1].id) : "";
 
   return { posts: posts.map((p) => ({ ...p, ...meta.byPostId[p.id] })), nextCursor };
 }
@@ -791,6 +795,7 @@ async function getPostsMeta(postIds, viewerCustomerId) {
   }
   if (!pool || postIds.length === 0) return { byPostId };
 
+  // Likes count
   const likesR = await pool.query(
     `SELECT post_id, COUNT(*)::int AS cnt
      FROM likes_v1
@@ -802,6 +807,7 @@ async function getPostsMeta(postIds, viewerCustomerId) {
     if (byPostId[row.post_id]) byPostId[row.post_id].like_count = Number(row.cnt) || 0;
   }
 
+  // Viewer liked
   if (viewerCustomerId) {
     const viewerR = await pool.query(
       `SELECT post_id
@@ -814,6 +820,7 @@ async function getPostsMeta(postIds, viewerCustomerId) {
     }
   }
 
+  // Comment counts
   const cCountR = await pool.query(
     `SELECT post_id, COUNT(*)::int AS cnt
      FROM comments_v1
@@ -825,6 +832,7 @@ async function getPostsMeta(postIds, viewerCustomerId) {
     if (byPostId[row.post_id]) byPostId[row.post_id].comment_count = Number(row.cnt) || 0;
   }
 
+  // Preview last 2 comments (author + body)
   const cR = await pool.query(
     `
     SELECT * FROM (
@@ -862,11 +870,7 @@ async function toggleLike({ shop, postId, customerId }) {
   await ensureSchema();
 
   try {
-    await pool.query(`INSERT INTO likes_v1 (shop, post_id, customer_id) VALUES ($1,$2,$3)`, [
-      shop,
-      postId,
-      customerId,
-    ]);
+    await pool.query(`INSERT INTO likes_v1 (shop, post_id, customer_id) VALUES ($1,$2,$3)`, [shop, postId, customerId]);
     return { liked: true };
   } catch {
     await pool.query(`DELETE FROM likes_v1 WHERE post_id=$1 AND customer_id=$2`, [postId, customerId]);
@@ -877,10 +881,12 @@ async function toggleLike({ shop, postId, customerId }) {
 async function addComment({ shop, postId, customerId, body }) {
   if (!pool) throw new Error("DB not configured");
   await ensureSchema();
-  await pool.query(
-    `INSERT INTO comments_v1 (shop, post_id, customer_id, body) VALUES ($1,$2,$3,$4)`,
-    [shop, postId, customerId, body]
-  );
+  await pool.query(`INSERT INTO comments_v1 (shop, post_id, customer_id, body) VALUES ($1,$2,$3,$4)`, [
+    shop,
+    postId,
+    customerId,
+    body,
+  ]);
 }
 
 /* ---------------------------
@@ -899,9 +905,12 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
   const mediaUrl = `${base}/posts/${id}/media`;
 
   const authorHref = `${base}/u/${encodeURIComponent(post.customer_id)}`;
-  const authorHtml = showAuthorLink
+  const authorAvatar = `${base}/avatar/${encodeURIComponent(post.customer_id || "")}`;
+
+  const authorNameHtml = showAuthorLink
     ? `<a href="${authorHref}" class="postAuthor">${escapeHtml(authorName)}</a>`
     : `<div class="postAuthor">${escapeHtml(authorName)}</div>`;
+
   const handleHtml = handle ? `<div class="muted small">${escapeHtml(handle)}</div>` : "";
 
   const mediaHtml = !hasMedia
@@ -929,11 +938,13 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
             const cAvatar = `${base}/avatar/${encodeURIComponent(c.customer_id || "")}`;
             return `
               <div class="commentItem">
-                <div class="commentHead">
+                <div class="commentRow">
                   <img class="commentAvatar" src="${cAvatar}" alt="" />
-                  <div class="commentAuthor">${escapeHtml(cn)}</div>
+                  <div class="commentBody">
+                    <div class="commentAuthor">${escapeHtml(cn)}</div>
+                    <div class="small commentText">${escapeHtml(c.body || "")}</div>
+                  </div>
                 </div>
-                <div class="small" style="white-space:pre-wrap">${escapeHtml(c.body || "")}</div>
               </div>
             `;
           })
@@ -942,10 +953,13 @@ function renderPostCard({ post, base, viewerId, showAuthorLink = true, returnPat
   return `
     <div class="postItem" id="post-${id}">
       <div class="postHeader">
-        <div>
-          ${authorHtml}
-          ${handleHtml}
-          <div class="muted small">${escapeHtml(when)}</div>
+        <div class="postAuthorRow">
+          <img class="postAuthorAvatar" src="${authorAvatar}" alt="" />
+          <div>
+            ${authorNameHtml}
+            ${handleHtml}
+            <div class="muted small">${escapeHtml(when)}</div>
+          </div>
         </div>
         <div class="postMetaRight"></div>
       </div>
@@ -1021,7 +1035,7 @@ proxy.get("/me/avatar", async (req, res) => {
   }
 });
 
-/** Avatar for any user (used in comments, requires login) */
+/** Avatar for any user (used in comments + post headers, requires login) */
 proxy.get("/avatar/:customerId", async (req, res) => {
   const viewerId = getViewerCustomerId(req);
   if (!viewerId) return res.status(200).type("text").send("Not logged in");
@@ -1078,14 +1092,10 @@ proxy.get("/", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!viewerId) {
-    return res
-      .type("html")
-      .send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res.type("html").send(page(`<p>Please log in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -1103,11 +1113,7 @@ proxy.get("/", async (req, res) => {
     posts.length === 0
       ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
       : `<div class="postList" id="feedList">
-          ${posts
-            .map((p) =>
-              renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}` })
-            )
-            .join("")}
+          ${posts.map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}` })).join("")}
         </div>`;
 
   const moreBlock = `
@@ -1201,12 +1207,7 @@ proxy.get("/feed/more", async (req, res) => {
     cursor,
   });
 
-  const html = posts
-    .map((p) =>
-      renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}` })
-    )
-    .join("");
-
+  const html = posts.map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: true, returnPath: `${base}` })).join("");
   return res.status(200).json({ html, nextCursor: nextCursor || "" });
 });
 
@@ -1223,10 +1224,7 @@ proxy.post("/posts/:id/like", async (req, res) => {
   if (!Number.isFinite(id)) return res.redirect(base);
 
   const returnPath = cleanText(req.body?.return, 300);
-  const fallback =
-    req.headers.referer && String(req.headers.referer).includes("/proxy")
-      ? req.headers.referer
-      : `${base}`;
+  const fallback = req.headers.referer && String(req.headers.referer).includes("/proxy") ? req.headers.referer : `${base}`;
 
   try {
     await toggleLike({ shop, postId: id, customerId: viewerId });
@@ -1252,10 +1250,7 @@ proxy.post("/posts/:id/comment", async (req, res) => {
 
   const body = cleanMultiline(req.body?.comment, 300);
   const returnPath = cleanText(req.body?.return, 300);
-  const fallback =
-    req.headers.referer && String(req.headers.referer).includes("/proxy")
-      ? req.headers.referer
-      : `${base}`;
+  const fallback = req.headers.referer && String(req.headers.referer).includes("/proxy") ? req.headers.referer : `${base}`;
 
   if (!body) return res.redirect(fallback + `#post-${id}`);
 
@@ -1276,14 +1271,10 @@ proxy.get("/me", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!viewerId) {
-    return res
-      .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
-    return res
-      .type("html")
-      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -1292,9 +1283,7 @@ proxy.get("/me", async (req, res) => {
   const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
 
   const handle = safeHandle(profile?.username);
-  const handleLine = handle
-    ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
-    : `<div class="muted handleUnder">Username not set</div>`;
+  const handleLine = handle ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>` : `<div class="muted handleUnder">Username not set</div>`;
 
   const avatarSrc = `${base}/me/avatar`;
   const editHref = `${base}/me/edit`;
@@ -1313,11 +1302,7 @@ proxy.get("/me", async (req, res) => {
     posts.length === 0
       ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
       : `<div class="postList">
-          ${posts
-            .map((p) =>
-              renderPostCard({ post: p, base, viewerId, showAuthorLink: false, returnPath: `${base}/me` })
-            )
-            .join("")}
+          ${posts.map((p) => renderPostCard({ post: p, base, viewerId, showAuthorLink: false, returnPath: `${base}/me` })).join("")}
         </div>`;
 
   return res.type("html").send(
@@ -1379,9 +1364,7 @@ proxy.get("/u/:customerId", async (req, res) => {
   if (viewerId && targetId === viewerId) return res.redirect(`${base}/me`);
 
   if (!viewerId) {
-    return res
-      .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -1392,9 +1375,7 @@ proxy.get("/u/:customerId", async (req, res) => {
 
   const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
   const handle = safeHandle(profile?.username);
-  const handleLine = handle
-    ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
-    : `<div class="muted handleUnder">Username not set</div>`;
+  const handleLine = handle ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>` : `<div class="muted handleUnder">Username not set</div>`;
 
   const ini = initialsFor(profile?.first_name || "", profile?.last_name || "");
   const avatarSvg = svgAvatar(ini);
@@ -1409,17 +1390,15 @@ proxy.get("/u/:customerId", async (req, res) => {
     posts.length === 0
       ? `<div class="postList"><p class="muted">No posts yet.</p></div>`
       : `<div class="postList">
-          ${posts
-            .map((p) =>
-              renderPostCard({
-                post: p,
-                base,
-                viewerId,
-                showAuthorLink: false,
-                returnPath: `${base}/u/${encodeURIComponent(targetId)}`,
-              })
-            )
-            .join("")}
+          ${posts.map((p) =>
+            renderPostCard({
+              post: p,
+              base,
+              viewerId,
+              showAuthorLink: false,
+              returnPath: `${base}/u/${encodeURIComponent(targetId)}`,
+            })
+          ).join("")}
         </div>`;
 
   return res.type("html").send(
@@ -1428,9 +1407,7 @@ proxy.get("/u/:customerId", async (req, res) => {
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
-              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(
-                avatarSvg
-              )}" alt="Profile photo" />
+              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(avatarSvg)}" alt="Profile photo" />
             </div>
 
             <div class="nameUnder">${escapeHtml(displayName)}</div>
@@ -1451,9 +1428,7 @@ proxy.get("/post/new", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!viewerId) {
-    return res
-      .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -1574,9 +1549,7 @@ proxy.get("/me/edit", async (req, res) => {
   const base = basePathFromReq(req);
 
   if (!viewerId) {
-    return res
-      .type("html")
-      .send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
+    return res.type("html").send(page(`<p>You are not logged in.</p><a class="btn" href="/account/login">Log in</a>`, req));
   }
   if (!pool) {
     return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
@@ -1622,14 +1595,10 @@ proxy.get("/me/edit", async (req, res) => {
               <input id="last_name" name="last_name" value="${escapeHtml(last)}" required />
 
               <label for="social_url">Social link</label>
-              <input id="social_url" name="social_url" value="${escapeHtml(
-                social_url
-              )}" placeholder="https://instagram.com/yourname" />
+              <input id="social_url" name="social_url" value="${escapeHtml(social_url)}" placeholder="https://instagram.com/yourname" />
 
               <label for="bio">Bio</label>
-              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(
-                bio
-              )}</textarea>
+              <textarea id="bio" name="bio" maxlength="500" placeholder="Tell the community about you...">${escapeHtml(bio)}</textarea>
 
               <div class="row">
                 <button class="btn" type="submit">Save</button>
@@ -1707,9 +1676,7 @@ proxy.post("/me/avatar", uploadAvatar.single("avatar"), async (req, res) => {
   }
 });
 
-proxy.get("/collection", (req, res) =>
-  res.type("html").send(page(`<p>Collection placeholder.</p>`, req))
-);
+proxy.get("/collection", (req, res) => res.type("html").send(page(`<p>Collection placeholder.</p>`, req)));
 proxy.get("/trades", (req, res) => res.type("html").send(page(`<p>Trades placeholder.</p>`, req)));
 
 app.use("/proxy", proxy);
