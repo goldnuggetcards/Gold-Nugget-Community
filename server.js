@@ -77,9 +77,9 @@ proxy.get("/", (req, res) => {
     <h1>Nugget Depot</h1>
     <p>Proxy working.</p>
     <ul>
-      <li><a href="/apps/community/me">My Profile</a></li>
-      <li><a href="/apps/community/collection">My Collection</a></li>
-      <li><a href="/apps/community/trades">Trades</a></li>
+      <li><a href="/apps/nuggetdepot/me">My Profile</a></li>
+      <li><a href="/apps/nuggetdepot/collection">My Collection</a></li>
+      <li><a href="/apps/nuggetdepot/trades">Trades</a></li>
     </ul>
   `);
 });
