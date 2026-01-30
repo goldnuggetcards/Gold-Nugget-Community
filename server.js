@@ -38,7 +38,7 @@ const upload = multer({
 async function ensureSchema() {
   if (!pool) return;
 
-  // Base table
+  // Base table (create if missing)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS profiles_v2 (
       customer_id TEXT PRIMARY KEY,
@@ -64,6 +64,30 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS dob DATE`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS favorite_pokemon TEXT NOT NULL DEFAULT ''`);
+
+  // Repair older tables created without defaults (prevents NULL insert failures)
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN first_name SET DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN last_name SET DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET DEFAULT ''`);
+
+  // Backfill any existing NULLs
+  await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
+  await pool.query(`UPDATE profiles_v2 SET avatar_mime = '' WHERE avatar_mime IS NULL`);
+
+  // Re-assert NOT NULL (in case older schema differed)
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET NOT NULL`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET NOT NULL`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET NOT NULL`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN first_name SET NOT NULL`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN last_name SET NOT NULL`);
+  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET NOT NULL`);
 }
 
 function buildProxyMessage(query) {
@@ -240,10 +264,17 @@ async function getAvatar(customerId) {
 async function ensureRow(customerId, shop) {
   if (!pool) throw new Error("DB not configured");
   await ensureSchema();
+
+  // Insert safe defaults for NOT NULL columns so older schemas cannot fail
   await pool.query(
-    `INSERT INTO profiles_v2 (customer_id, shop)
-     VALUES ($1,$2)
-     ON CONFLICT (customer_id) DO UPDATE SET shop=EXCLUDED.shop, updated_at=NOW()`,
+    `INSERT INTO profiles_v2 (
+        customer_id, shop,
+        username, full_name, favorite_pokemon,
+        first_name, last_name, avatar_mime
+     )
+     VALUES ($1,$2,'','','','','','')
+     ON CONFLICT (customer_id)
+     DO UPDATE SET shop=EXCLUDED.shop, updated_at=NOW()`,
     [customerId, shop]
   );
 }
