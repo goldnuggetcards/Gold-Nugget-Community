@@ -6,9 +6,8 @@
 // - Optional media (photo or video)
 // - Send creates post and redirects back to /me
 // - Public profile route /u/:customerId does NOT show the post box
-// Notes:
-// - Links/forms do NOT carry signed querystring
-// - Uses Shopify path_prefix when available
+// Fix included:
+// - Send button enables when EITHER text OR media is selected
 
 import express from "express";
 import crypto from "crypto";
@@ -67,29 +66,17 @@ async function ensureSchema() {
     );
   `);
 
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
-  );
+  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`);
 
   // Backfill NULLs
   await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
-  await pool.query(
-    `UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`
-  );
+  await pool.query(`UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
   await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
@@ -433,10 +420,7 @@ async function listPostsForCustomer(customerId, limit = 20) {
 async function getPostMedia(postId) {
   if (!pool) return null;
   await ensureSchema();
-  const r = await pool.query(
-    `SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`,
-    [postId]
-  );
+  const r = await pool.query(`SELECT media_bytes, media_mime FROM posts_v1 WHERE id=$1`, [postId]);
   return r.rows?.[0] || null;
 }
 
@@ -657,7 +641,6 @@ proxy.get("/u/:customerId", async (req, res) => {
     : `<div class="muted handleUnder">Username not set</div>`;
 
   // Avatar endpoint currently only supports "me", so use initials fallback for public view for now.
-  // If you want public avatars, add /avatar/:customerId endpoint later.
   const ini = initialsFor(profile?.first_name || "", profile?.last_name || "");
   const avatarSvg = svgAvatar(ini);
 
@@ -771,17 +754,22 @@ proxy.get("/post/new", async (req, res) => {
         <script>
           (function(){
             const ta = document.getElementById('body');
+            const media = document.getElementById('media');
             const btn = document.getElementById('sendBtn');
+
             function update(){
               const hasText = ta && ta.value && ta.value.trim().length > 0;
-              btn.disabled = !hasText;
+              const hasMedia = media && media.files && media.files.length > 0;
+              const ok = hasText || hasMedia;
+
+              btn.disabled = !ok;
               btn.style.opacity = btn.disabled ? '0.5' : '1';
               btn.style.cursor = btn.disabled ? 'not-allowed' : 'pointer';
             }
-            if (ta && btn) {
-              ta.addEventListener('input', update);
-              update();
-            }
+
+            if (ta) ta.addEventListener('input', update);
+            if (media) media.addEventListener('change', update);
+            update();
           })();
         </script>
       `,
