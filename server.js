@@ -29,6 +29,13 @@
 // UPDATE (LOGIN REDIRECT):
 // - All "Log in" links now send Shopify login with return_url=https://www.goldnuggetcards.com/
 //   so after Shopify login they land on the homepage.
+// UPDATE (FOLLOW + DIRECT MESSAGES):
+// - Public profile shows Follow + Message buttons under username
+// - Follow toggles to checkmark
+// - Message opens a DM page with message box, optional file, send button
+// - Added Inbox page (/inbox) listing recent conversations
+// UPDATE (MOBILE SCALING):
+// - Reduced overall sizing on small screens so content fits better
 
 import express from "express";
 import crypto from "crypto";
@@ -89,6 +96,12 @@ const uploadAvatar = multer({
 const uploadPostMedia = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB PER FILE
+});
+
+// DM: one optional file per message (10MB)
+const uploadMessageMedia = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
 const MAX_MEDIA_FILES = 8;
@@ -253,6 +266,57 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET NOT NULL`);
   await pool.query(
     `CREATE INDEX IF NOT EXISTS comments_v1_post_created_idx ON comments_v1 (post_id, created_at ASC)`
+  );
+
+  // Follows
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS follows_v1 (
+      follower_id TEXT NOT NULL,
+      followed_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (follower_id, followed_id)
+    );
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS follows_v1_followed_idx ON follows_v1 (followed_id, created_at DESC)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS follows_v1_follower_idx ON follows_v1 (follower_id, created_at DESC)`
+  );
+
+  // Direct messages + media
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages_v1 (
+      id BIGSERIAL PRIMARY KEY,
+      shop TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      receiver_id TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE messages_v1 ALTER COLUMN body SET DEFAULT ''`);
+  await pool.query(`UPDATE messages_v1 SET body = '' WHERE body IS NULL`);
+  await pool.query(`ALTER TABLE messages_v1 ALTER COLUMN body SET NOT NULL`);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS messages_v1_pair_idx ON messages_v1 (sender_id, receiver_id, created_at DESC, id DESC)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS messages_v1_receiver_idx ON messages_v1 (receiver_id, created_at DESC, id DESC)`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS message_media_v1 (
+      message_id BIGINT NOT NULL,
+      idx INT NOT NULL,
+      media_bytes BYTEA NOT NULL,
+      media_mime TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (message_id, idx)
+    );
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS message_media_v1_msg_idx ON message_media_v1 (message_id)`
   );
 }
 
@@ -468,6 +532,20 @@ function allowedMediaMime(m) {
   return allowed.has(String(m || "").toLowerCase());
 }
 
+function allowedMessageMime(m) {
+  const allowed = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+    "application/pdf",
+  ]);
+  return allowed.has(String(m || "").toLowerCase());
+}
+
 function isVideoMime(m) {
   return String(m || "").toLowerCase().startsWith("video/");
 }
@@ -509,7 +587,7 @@ function page(bodyHtml, reqForBase) {
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Nugget Depot</title>
     <style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.35}
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.35;font-size:16px}
       a{color:inherit}
       .nav a{margin-right:12px}
       .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:none;width:100%}
@@ -652,7 +730,7 @@ function page(bodyHtml, reqForBase) {
       .mediaGrid{
         width:100%;
         display:grid;
-        grid-template-columns: 1fr; /* full width */
+        grid-template-columns: 1fr;
         gap:10px;
         margin-top:10px;
       }
@@ -745,6 +823,41 @@ function page(bodyHtml, reqForBase) {
         margin-top:0;
       }
 
+      /* Profile actions (Follow + Message) */
+      .profileActions{
+        display:flex;
+        gap:10px;
+        margin-top:10px;
+        flex-wrap:wrap;
+        justify-content:center;
+      }
+      .pillBtn{
+        border:1px solid #ddd;
+        border-radius:999px;
+        padding:10px 14px;
+        background:#fff;
+        cursor:pointer;
+        font-weight:900;
+        display:inline-flex;
+        align-items:center;
+        gap:8px;
+        text-decoration:none;
+      }
+      .pillBtn.primary{border-color:#111}
+      .pillIcon{font-size:16px;line-height:1}
+
+      /* DM UI */
+      .dmWrap{width:100%;max-width:920px;margin-top:14px}
+      .dmThread{border:1px solid #eee;border-radius:12px;padding:12px;background:#fff}
+      .dmMsg{padding:10px 12px;border-radius:12px;max-width:78%;border:1px solid #eee;background:#fafafa}
+      .dmRow{display:flex;margin-top:10px}
+      .dmRow.me{justify-content:flex-end}
+      .dmRow.me .dmMsg{background:#fff;border-color:#ddd}
+      .dmMeta{font-size:12px;opacity:.7;margin-top:6px}
+      .dmComposer{margin-top:12px;border-top:1px solid #eee;padding-top:12px}
+      .dmFile{margin-top:10px}
+      .dmMediaLink{display:inline-block;margin-top:8px}
+
       /* Lightbox */
       .lb{
         position:fixed;
@@ -805,11 +918,21 @@ function page(bodyHtml, reqForBase) {
         gap:10px;
       }
 
+      /* Mobile scaling: slightly smaller overall so it fits better */
       @media (max-width: 520px){
-        body{margin:16px}
+        body{margin:14px;font-size:14px}
+        .card{padding:12px}
+        input, textarea{padding:9px 10px}
         .collectionsRow{grid-template-columns: 1fr}
-        .actionBtn{padding:10px 10px}
+        .actionBtn{padding:9px 10px}
         .heartIcon{font-size:20px}
+        .avatarBox{width:104px;height:104px}
+        .avatar{width:104px;height:104px;border-radius:14px}
+        .postAuthorAvatar,.commentAvatar{width:40px;height:40px;border-radius:12px}
+        .composerFake{min-width:160px}
+        .tabBtn{padding:9px 12px}
+        .pillBtn{padding:8px 12px}
+        .dmMsg{max-width:90%}
       }
     </style>
   </head>
@@ -819,6 +942,7 @@ function page(bodyHtml, reqForBase) {
       <a href="${base}/me">My Profile</a>
       <a href="${base}/collection">My Collection</a>
       <a href="${base}/trades">Trades</a>
+      <a href="${base}/inbox">Messages</a>
     </div>
     <hr/>
     <div class="card">
@@ -1377,6 +1501,146 @@ async function addComment({ shop, postId, customerId, body }) {
 }
 
 /* ---------------------------
+   Follow + DM helpers
+---------------------------- */
+
+async function isFollowing({ followerId, followedId }) {
+  if (!pool) return false;
+  await ensureSchema();
+  if (!followerId || !followedId) return false;
+
+  const r = await pool.query(
+    `SELECT 1 FROM follows_v1 WHERE follower_id=$1 AND followed_id=$2 LIMIT 1`,
+    [followerId, followedId]
+  );
+  return (r.rows || []).length > 0;
+}
+
+async function toggleFollow({ followerId, followedId }) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
+
+  try {
+    await pool.query(
+      `INSERT INTO follows_v1 (follower_id, followed_id) VALUES ($1,$2)`,
+      [followerId, followedId]
+    );
+    return { following: true };
+  } catch {
+    await pool.query(
+      `DELETE FROM follows_v1 WHERE follower_id=$1 AND followed_id=$2`,
+      [followerId, followedId]
+    );
+    return { following: false };
+  }
+}
+
+async function createMessage({ shop, senderId, receiverId, body }) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
+
+  const r = await pool.query(
+    `INSERT INTO messages_v1 (shop, sender_id, receiver_id, body)
+     VALUES ($1,$2,$3,$4)
+     RETURNING id`,
+    [shop, senderId, receiverId, body || ""]
+  );
+  return r.rows?.[0]?.id || null;
+}
+
+async function addMessageMedia(messageId, mediaItems) {
+  if (!pool) throw new Error("DB not configured");
+  await ensureSchema();
+  if (!messageId) return;
+
+  const items = Array.isArray(mediaItems) ? mediaItems : [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (!it?.bytes || !it?.mime) continue;
+    await pool.query(
+      `INSERT INTO message_media_v1 (message_id, idx, media_bytes, media_mime)
+       VALUES ($1,$2,$3,$4)`,
+      [messageId, i, it.bytes, it.mime]
+    );
+  }
+}
+
+async function listConversation({ viewerId, otherId, limit = 30 }) {
+  if (!pool) return [];
+  await ensureSchema();
+
+  const r = await pool.query(
+    `
+    SELECT
+      m.id, m.shop, m.sender_id, m.receiver_id, m.body, m.created_at,
+      (SELECT COUNT(*)::int FROM message_media_v1 mm WHERE mm.message_id = m.id) AS media_count
+    FROM messages_v1 m
+    WHERE
+      (m.sender_id=$1 AND m.receiver_id=$2)
+      OR
+      (m.sender_id=$2 AND m.receiver_id=$1)
+    ORDER BY m.created_at DESC, m.id DESC
+    LIMIT $3
+    `,
+    [viewerId, otherId, limit]
+  );
+
+  return (r.rows || []).reverse();
+}
+
+async function listInbox({ viewerId, limit = 50 }) {
+  if (!pool) return [];
+  await ensureSchema();
+
+  const r = await pool.query(
+    `
+    SELECT
+      m.id, m.sender_id, m.receiver_id, m.body, m.created_at,
+      CASE WHEN m.sender_id=$1 THEN m.receiver_id ELSE m.sender_id END AS other_id
+    FROM messages_v1 m
+    WHERE m.sender_id=$1 OR m.receiver_id=$1
+    ORDER BY m.created_at DESC, m.id DESC
+    LIMIT $2
+    `,
+    [viewerId, limit]
+  );
+
+  const seen = new Set();
+  const out = [];
+  for (const row of r.rows || []) {
+    const oid = row.other_id;
+    if (!oid || seen.has(oid)) continue;
+    seen.add(oid);
+    out.push(row);
+  }
+  return out;
+}
+
+async function getMessageById(messageId) {
+  if (!pool) return null;
+  await ensureSchema();
+  const r = await pool.query(
+    `SELECT id, shop, sender_id, receiver_id, body, created_at FROM messages_v1 WHERE id=$1`,
+    [messageId]
+  );
+  return r.rows?.[0] || null;
+}
+
+async function getMessageMediaRow(messageId, idx) {
+  if (!pool) return null;
+  await ensureSchema();
+
+  const i = Number(idx);
+  if (!Number.isFinite(i) || i < 0) return null;
+
+  const r = await pool.query(
+    `SELECT media_bytes, media_mime FROM message_media_v1 WHERE message_id=$1 AND idx=$2`,
+    [messageId, i]
+  );
+  return r.rows?.[0] || null;
+}
+
+/* ---------------------------
    Rendering helpers
 ---------------------------- */
 
@@ -1687,6 +1951,37 @@ proxy.get("/posts/:id/media", async (req, res) => {
   }
 });
 
+/** Message attachment (only sender/receiver can access) */
+proxy.get("/messages/:id/media/:idx", async (req, res) => {
+  const viewerId = getViewerCustomerId(req);
+  if (!viewerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
+
+  const id = Number(req.params.id);
+  const idx = Number(req.params.idx);
+  if (!Number.isFinite(id) || !Number.isFinite(idx))
+    return res.status(404).type("text").send("Not found");
+
+  try {
+    const msg = await getMessageById(id);
+    if (!msg) return res.status(404).type("text").send("Not found");
+
+    const allowed =
+      String(msg.sender_id) === String(viewerId) || String(msg.receiver_id) === String(viewerId);
+    if (!allowed) return res.status(404).type("text").send("Not found");
+
+    const m = await getMessageMediaRow(id, idx);
+    if (!m?.media_bytes || !m?.media_mime) return res.status(404).type("text").send("Not found");
+
+    res.setHeader("Content-Type", m.media_mime);
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(m.media_bytes);
+  } catch (e) {
+    console.error("message media error:", e);
+    return res.status(200).type("text").send("Media error");
+  }
+});
+
 /** Feed page (tabs) */
 proxy.get("/", async (req, res) => {
   const shop = getShop(req);
@@ -1699,7 +1994,9 @@ proxy.get("/", async (req, res) => {
       .send(page(`<p>Please log in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -1927,7 +2224,9 @@ proxy.get("/me", async (req, res) => {
       .send(page(`<p>You are not logged in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -2013,8 +2312,9 @@ proxy.get("/me", async (req, res) => {
   );
 });
 
-/** Public profile: /u/:customerId (feed-only posts, no composer) */
+/** Public profile: /u/:customerId (feed-only posts, Follow + Message buttons) */
 proxy.get("/u/:customerId", async (req, res) => {
+  const shop = getShop(req);
   const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
 
@@ -2029,20 +2329,45 @@ proxy.get("/u/:customerId", async (req, res) => {
       .send(page(`<p>You are not logged in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
+
+  await ensureRow(viewerId, shop);
+  await ensureRow(targetId, shop);
 
   const profile = await getProfile(targetId);
   if (!profile) return res.type("html").send(page(`<p class="error">User not found.</p>`, req));
 
-  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
+  const displayName =
+    `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "Name not set";
   const handle = safeHandle(profile?.username);
   const handleLine = handle
     ? `<div class="muted handleUnder">${escapeHtml(handle)}</div>`
     : `<div class="muted handleUnder">Username not set</div>`;
 
-  const ini = initialsFor(profile?.first_name || "", profile?.last_name || "");
-  const avatarSvg = svgAvatar(ini);
+  const avatarSrc = `${base}/avatar/${encodeURIComponent(targetId)}`;
+
+  const following = await isFollowing({ followerId: viewerId, followedId: targetId });
+  const followAction = `${base}/u/${encodeURIComponent(targetId)}/follow`;
+  const dmHref = `${base}/dm/${encodeURIComponent(targetId)}`;
+
+  const actionsHtml = `
+    <div class="profileActions">
+      <form method="POST" action="${followAction}" style="margin:0">
+        <button class="pillBtn primary" type="submit" aria-label="Follow">
+          <span class="pillIcon">${following ? "✓" : "＋"}</span>
+          <span>${following ? "Following" : "Follow"}</span>
+        </button>
+      </form>
+
+      <a class="pillBtn" href="${dmHref}" aria-label="Message">
+        <span class="pillIcon">✉</span>
+        <span>Message</span>
+      </a>
+    </div>
+  `;
 
   const { posts } = await listPostsForCustomerWithMeta({
     targetCustomerId: targetId,
@@ -2073,11 +2398,12 @@ proxy.get("/u/:customerId", async (req, res) => {
         <div class="profileTop">
           <div class="avatarWrap">
             <div class="avatarBox">
-              <img class="avatar" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(avatarSvg)}" alt="Profile photo" />
+              <img class="avatar" src="${avatarSrc}" alt="Profile photo" />
             </div>
 
             <div class="nameUnder">${escapeHtml(displayName)}</div>
             ${handleLine}
+            ${actionsHtml}
 
             ${postsHtml}
           </div>
@@ -2086,6 +2412,243 @@ proxy.get("/u/:customerId", async (req, res) => {
       req
     )
   );
+});
+
+/** Follow toggle */
+proxy.post("/u/:customerId/follow", async (req, res) => {
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
+
+  const targetId = String(req.params.customerId || "").trim();
+  if (!targetId) return res.redirect(base);
+  if (targetId === viewerId) return res.redirect(`${base}/me`);
+
+  try {
+    await toggleFollow({ followerId: viewerId, followedId: targetId });
+    return res.redirect(`${base}/u/${encodeURIComponent(targetId)}`);
+  } catch (e) {
+    console.error("follow error:", e);
+    return res.redirect(`${base}/u/${encodeURIComponent(targetId)}`);
+  }
+});
+
+/** Inbox */
+proxy.get("/inbox", async (req, res) => {
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) {
+    return res
+      .type("html")
+      .send(page(`<p>Please log in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
+  }
+  if (!pool) {
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+  }
+
+  const items = await listInbox({ viewerId, limit: 80 });
+
+  const otherIds = items.map((x) => String(x.other_id)).filter(Boolean);
+  const namesById = {};
+  if (otherIds.length) {
+    const r = await pool.query(
+      `SELECT customer_id, first_name, last_name, username FROM profiles_v2 WHERE customer_id = ANY($1::text[])`,
+      [otherIds]
+    );
+    for (const row of r.rows || []) {
+      const nm = `${row.first_name || ""} ${row.last_name || ""}`.trim() || "User";
+      namesById[row.customer_id] = { name: nm, username: row.username || "" };
+    }
+  }
+
+  const listHtml =
+    items.length === 0
+      ? `<p class="muted">No messages yet.</p>`
+      : `<div class="postList">
+          ${items
+            .map((it) => {
+              const oid = String(it.other_id || "");
+              const info = namesById[oid] || { name: "User", username: "" };
+              const href = `${base}/dm/${encodeURIComponent(oid)}`;
+              const snippet = escapeHtml(String(it.body || "").slice(0, 120));
+              const when = new Date(it.created_at).toLocaleString();
+              return `
+                <div class="postItem">
+                  <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
+                    <div>
+                      <div style="font-weight:900"><a href="${href}">${escapeHtml(info.name)}</a></div>
+                      ${info.username ? `<div class="muted small">${escapeHtml(safeHandle(info.username))}</div>` : ""}
+                      <div class="muted small">${escapeHtml(when)}</div>
+                    </div>
+                  </div>
+                  <div style="margin-top:8px">${snippet || "<span class='muted'>No text</span>"}</div>
+                </div>
+              `;
+            })
+            .join("")}
+        </div>`;
+
+  return res.type("html").send(
+    page(
+      `
+        <div class="stack">
+          <div style="font-weight:900;font-size:18px">Messages</div>
+          ${listHtml}
+        </div>
+      `,
+      req
+    )
+  );
+});
+
+/** DM page */
+proxy.get("/dm/:customerId", async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) {
+    return res
+      .type("html")
+      .send(page(`<p>Please log in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
+  }
+  if (!pool) {
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+  }
+
+  const targetId = String(req.params.customerId || "").trim();
+  if (!targetId || targetId === viewerId) return res.redirect(`${base}/me`);
+
+  await ensureRow(viewerId, shop);
+  await ensureRow(targetId, shop);
+
+  const profile = await getProfile(targetId);
+  if (!profile) return res.type("html").send(page(`<p class="error">User not found.</p>`, req));
+
+  const displayName = `${profile?.first_name || ""} ${profile?.last_name || ""}`.trim() || "User";
+  const convo = await listConversation({ viewerId, otherId: targetId, limit: 30 });
+
+  const sent = req.query.sent === "1";
+
+  const threadHtml =
+    convo.length === 0
+      ? `<div class="muted">No messages yet.</div>`
+      : convo
+          .map((m) => {
+            const mine = String(m.sender_id) === String(viewerId);
+            const when = new Date(m.created_at).toLocaleString();
+            const text = escapeHtml(m.body || "");
+            const mediaLink =
+              Number(m.media_count || 0) > 0
+                ? `<a class="dmMediaLink" href="${base}/messages/${Number(m.id)}/media/0" target="_blank" rel="noreferrer">View attachment</a>`
+                : "";
+            return `
+              <div class="dmRow ${mine ? "me" : ""}">
+                <div class="dmMsg">
+                  ${text ? `<div style="white-space:pre-wrap">${text}</div>` : `<div class="muted small">No text</div>`}
+                  ${mediaLink}
+                  <div class="dmMeta">${escapeHtml(when)}</div>
+                </div>
+              </div>
+            `;
+          })
+          .join("");
+
+  return res.type("html").send(
+    page(
+      `
+        <div class="stack dmWrap">
+          <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
+            <div>
+              <div style="font-weight:900;font-size:18px">Message ${escapeHtml(displayName)}</div>
+              <div class="muted small">${escapeHtml(safeHandle(profile?.username || ""))}</div>
+            </div>
+            <a class="btn" href="${base}/u/${encodeURIComponent(targetId)}">Back</a>
+          </div>
+
+          ${sent ? `<p class="muted small">Sent.</p>` : ""}
+
+          <div class="dmThread" style="margin-top:12px">
+            ${threadHtml}
+          </div>
+
+          <div class="dmComposer">
+            <form method="POST" enctype="multipart/form-data" action="${base}/dm/${encodeURIComponent(
+              targetId
+            )}">
+              <label for="dm_body">Message</label>
+              <textarea id="dm_body" name="body" maxlength="2000" placeholder="Write a message (max 2000 characters)" style="min-height:120px"></textarea>
+
+              <div class="dmFile">
+                <label for="dm_file">Add a file (optional)</label>
+                <input id="dm_file" type="file" name="file" accept="image/*,video/*,application/pdf" />
+                <div class="muted small help">10MB max. Images, video, or PDF.</div>
+              </div>
+
+              <div class="row">
+                <button class="btn" type="submit">Send</button>
+                <a class="btn" href="${base}/inbox">Inbox</a>
+              </div>
+            </form>
+          </div>
+        </div>
+      `,
+      req
+    )
+  );
+});
+
+/** Send DM */
+proxy.post("/dm/:customerId", uploadMessageMedia.single("file"), async (req, res) => {
+  const shop = getShop(req);
+  const viewerId = getViewerCustomerId(req);
+  const base = basePathFromReq(req);
+
+  if (!viewerId) return res.status(200).type("text").send("Not logged in");
+  if (!pool) return res.status(200).type("text").send("DB not configured");
+
+  const targetId = String(req.params.customerId || "").trim();
+  if (!targetId || targetId === viewerId) return res.redirect(`${base}/me`);
+
+  const body = cleanMultiline(req.body?.body, 2000);
+
+  const mediaItems = [];
+  if (req.file?.buffer && req.file?.mimetype) {
+    if (!allowedMessageMime(req.file.mimetype)) {
+      return res.redirect(`${base}/dm/${encodeURIComponent(targetId)}`);
+    }
+    mediaItems.push({ bytes: req.file.buffer, mime: req.file.mimetype });
+  }
+
+  const hasText = !!(body && body.trim());
+  const hasMedia = mediaItems.length > 0;
+  if (!hasText && !hasMedia) return res.redirect(`${base}/dm/${encodeURIComponent(targetId)}`);
+
+  try {
+    await ensureRow(viewerId, shop);
+    await ensureRow(targetId, shop);
+
+    const msgId = await createMessage({
+      shop,
+      senderId: viewerId,
+      receiverId: targetId,
+      body,
+    });
+
+    if (msgId && hasMedia) await addMessageMedia(msgId, mediaItems);
+
+    return res.redirect(`${base}/dm/${encodeURIComponent(targetId)}?sent=1`);
+  } catch (e) {
+    console.error("dm send error:", e);
+    return res.redirect(`${base}/dm/${encodeURIComponent(targetId)}`);
+  }
 });
 
 /** Collection page (bucket=collection only, required media, two-column grid) */
@@ -2100,7 +2663,9 @@ proxy.get("/collection", async (req, res) => {
       .send(page(`<p>Please log in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -2206,7 +2771,9 @@ proxy.get("/trades", async (req, res) => {
       .send(page(`<p>Please log in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
@@ -2329,7 +2896,7 @@ proxy.get("/bucket/more", async (req, res) => {
   return res.status(200).json({ html, nextCursor: nextCursor || "" });
 });
 
-/** New post page (feed bucket only via this UI; supports multi-media) */
+/** New post page (supports multi-media) */
 proxy.get("/post/new", async (req, res) => {
   const viewerId = getViewerCustomerId(req);
   const base = basePathFromReq(req);
@@ -2340,7 +2907,9 @@ proxy.get("/post/new", async (req, res) => {
       .send(page(`<p>You are not logged in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   const r = typeof req.query.return === "string" ? req.query.return : "feed";
@@ -2478,7 +3047,9 @@ proxy.get("/me/edit", async (req, res) => {
       .send(page(`<p>You are not logged in.</p><a class="btn" href="${shopifyLoginHref()}">Log in</a>`, req));
   }
   if (!pool) {
-    return res.type("html").send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
+    return res
+      .type("html")
+      .send(page(`<p class="error">DATABASE_URL not set. Add it on Render.</p>`, req));
   }
 
   await ensureRow(viewerId, shop);
