@@ -36,6 +36,9 @@
 // - Added Inbox page (/inbox) listing recent conversations
 // UPDATE (MOBILE SCALING):
 // - Reduced overall sizing on small screens so content fits better
+//
+// IMPORTANT PERF UPDATE:
+// - ensureSchema() is memoized so schema setup runs once per process (avoids repeated ALTER/UPDATE/INDEX work)
 
 import express from "express";
 import crypto from "crypto";
@@ -69,6 +72,9 @@ const pool = DATABASE_URL
       ssl: { rejectUnauthorized: false },
     })
   : null;
+
+// Memoize schema initialization so it runs once per process
+let schemaInitPromise = null;
 
 const GOLD_NUGGET_LOGO_URL =
   "https://cdn.shopify.com/s/files/1/0681/6589/4299/files/LOGO_w_TEXT_-_Gold_Nugget_467d90fd-4797-4d4f-9ddc-f86b47c98edf.png?v=1748970231";
@@ -122,202 +128,211 @@ function bucketLabel(bucket) {
 async function ensureSchema() {
   if (!pool) return;
 
-  // Profiles
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS profiles_v2 (
-      customer_id TEXT PRIMARY KEY,
-      shop TEXT NOT NULL,
-      username TEXT NOT NULL DEFAULT '',
-      full_name TEXT NOT NULL DEFAULT '',
-      dob DATE,
-      favorite_pokemon TEXT NOT NULL DEFAULT '',
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  if (schemaInitPromise) return schemaInitPromise;
+
+  schemaInitPromise = (async () => {
+    // Profiles
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS profiles_v2 (
+        customer_id TEXT PRIMARY KEY,
+        shop TEXT NOT NULL,
+        username TEXT NOT NULL DEFAULT '',
+        full_name TEXT NOT NULL DEFAULT '',
+        dob DATE,
+        favorite_pokemon TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(
+      `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
     );
-  `);
-
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
-  );
-  await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
-  await pool.query(
-    `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
-  );
-
-  // Backfill NULLs
-  await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
-  await pool.query(
-    `UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`
-  );
-  await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET social_url = '' WHERE social_url IS NULL`);
-  await pool.query(`UPDATE profiles_v2 SET avatar_mime = '' WHERE avatar_mime IS NULL`);
-
-  // Defaults + not null
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN first_name SET DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN last_name SET DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN bio SET DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET DEFAULT ''`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET DEFAULT ''`);
-
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET NOT NULL`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET NOT NULL`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET NOT NULL`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN first_name SET NOT NULL`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN last_name SET NOT NULL`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN bio SET NOT NULL`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET NOT NULL`);
-  await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET NOT NULL`);
-
-  // Posts (legacy single media columns kept for backward compatibility)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS posts_v1 (
-      id BIGSERIAL PRIMARY KEY,
-      shop TEXT NOT NULL,
-      customer_id TEXT NOT NULL,
-      body TEXT NOT NULL DEFAULT '',
-      media_bytes BYTEA,
-      media_mime TEXT NOT NULL DEFAULT '',
-      bucket TEXT NOT NULL DEFAULT 'feed',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    await pool.query(
+      `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''`
     );
-  `);
-
-  // Ensure new bucket column exists if older table already created
-  await pool.query(
-    `ALTER TABLE posts_v1 ADD COLUMN IF NOT EXISTS bucket TEXT NOT NULL DEFAULT 'feed'`
-  );
-
-  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET DEFAULT ''`);
-  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET DEFAULT ''`);
-  await pool.query(`UPDATE posts_v1 SET body = '' WHERE body IS NULL`);
-  await pool.query(`UPDATE posts_v1 SET media_mime = '' WHERE media_mime IS NULL`);
-  await pool.query(
-    `UPDATE posts_v1 SET bucket = 'feed' WHERE bucket IS NULL OR bucket = ''`
-  );
-  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET NOT NULL`);
-  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET NOT NULL`);
-  await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN bucket SET NOT NULL`);
-
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS posts_v1_shop_bucket_created_idx ON posts_v1 (shop, bucket, created_at DESC, id DESC)`
-  );
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS posts_v1_customer_bucket_created_idx ON posts_v1 (customer_id, bucket, created_at DESC, id DESC)`
-  );
-
-  // Multi-media per post
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS post_media_v1 (
-      post_id BIGINT NOT NULL,
-      idx INT NOT NULL,
-      media_bytes BYTEA NOT NULL,
-      media_mime TEXT NOT NULL DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (post_id, idx)
+    await pool.query(
+      `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''`
     );
-  `);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS post_media_v1_post_idx ON post_media_v1 (post_id)`
-  );
-
-  // Likes
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS likes_v1 (
-      shop TEXT NOT NULL,
-      post_id BIGINT NOT NULL,
-      customer_id TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (post_id, customer_id)
+    await pool.query(
+      `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS social_url TEXT NOT NULL DEFAULT ''`
     );
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS likes_v1_post_idx ON likes_v1 (post_id)`);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS likes_v1_customer_idx ON likes_v1 (customer_id)`
-  );
-
-  // Comments
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS comments_v1 (
-      id BIGSERIAL PRIMARY KEY,
-      shop TEXT NOT NULL,
-      post_id BIGINT NOT NULL,
-      customer_id TEXT NOT NULL,
-      body TEXT NOT NULL DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    await pool.query(`ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA`);
+    await pool.query(
+      `ALTER TABLE profiles_v2 ADD COLUMN IF NOT EXISTS avatar_mime TEXT NOT NULL DEFAULT ''`
     );
-  `);
-  await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET DEFAULT ''`);
-  await pool.query(`UPDATE comments_v1 SET body = '' WHERE body IS NULL`);
-  await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET NOT NULL`);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS comments_v1_post_created_idx ON comments_v1 (post_id, created_at ASC)`
-  );
 
-  // Follows
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS follows_v1 (
-      follower_id TEXT NOT NULL,
-      followed_id TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (follower_id, followed_id)
+    // Backfill NULLs
+    await pool.query(`UPDATE profiles_v2 SET username = '' WHERE username IS NULL`);
+    await pool.query(`UPDATE profiles_v2 SET full_name = '' WHERE full_name IS NULL`);
+    await pool.query(
+      `UPDATE profiles_v2 SET favorite_pokemon = '' WHERE favorite_pokemon IS NULL`
     );
-  `);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS follows_v1_followed_idx ON follows_v1 (followed_id, created_at DESC)`
-  );
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS follows_v1_follower_idx ON follows_v1 (follower_id, created_at DESC)`
-  );
+    await pool.query(`UPDATE profiles_v2 SET first_name = '' WHERE first_name IS NULL`);
+    await pool.query(`UPDATE profiles_v2 SET last_name = '' WHERE last_name IS NULL`);
+    await pool.query(`UPDATE profiles_v2 SET bio = '' WHERE bio IS NULL`);
+    await pool.query(`UPDATE profiles_v2 SET social_url = '' WHERE social_url IS NULL`);
+    await pool.query(`UPDATE profiles_v2 SET avatar_mime = '' WHERE avatar_mime IS NULL`);
 
-  // Direct messages + media
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS messages_v1 (
-      id BIGSERIAL PRIMARY KEY,
-      shop TEXT NOT NULL,
-      sender_id TEXT NOT NULL,
-      receiver_id TEXT NOT NULL,
-      body TEXT NOT NULL DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-  await pool.query(`ALTER TABLE messages_v1 ALTER COLUMN body SET DEFAULT ''`);
-  await pool.query(`UPDATE messages_v1 SET body = '' WHERE body IS NULL`);
-  await pool.query(`ALTER TABLE messages_v1 ALTER COLUMN body SET NOT NULL`);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS messages_v1_pair_idx ON messages_v1 (sender_id, receiver_id, created_at DESC, id DESC)`
-  );
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS messages_v1_receiver_idx ON messages_v1 (receiver_id, created_at DESC, id DESC)`
-  );
+    // Defaults + not null
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN first_name SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN last_name SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN bio SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET DEFAULT ''`);
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS message_media_v1 (
-      message_id BIGINT NOT NULL,
-      idx INT NOT NULL,
-      media_bytes BYTEA NOT NULL,
-      media_mime TEXT NOT NULL DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (message_id, idx)
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN username SET NOT NULL`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN full_name SET NOT NULL`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN favorite_pokemon SET NOT NULL`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN first_name SET NOT NULL`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN last_name SET NOT NULL`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN bio SET NOT NULL`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN social_url SET NOT NULL`);
+    await pool.query(`ALTER TABLE profiles_v2 ALTER COLUMN avatar_mime SET NOT NULL`);
+
+    // Posts (legacy single media columns kept for backward compatibility)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS posts_v1 (
+        id BIGSERIAL PRIMARY KEY,
+        shop TEXT NOT NULL,
+        customer_id TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        media_bytes BYTEA,
+        media_mime TEXT NOT NULL DEFAULT '',
+        bucket TEXT NOT NULL DEFAULT 'feed',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // Ensure new bucket column exists if older table already created
+    await pool.query(
+      `ALTER TABLE posts_v1 ADD COLUMN IF NOT EXISTS bucket TEXT NOT NULL DEFAULT 'feed'`
     );
-  `);
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS message_media_v1_msg_idx ON message_media_v1 (message_id)`
-  );
+
+    await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET DEFAULT ''`);
+    await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET DEFAULT ''`);
+    await pool.query(`UPDATE posts_v1 SET body = '' WHERE body IS NULL`);
+    await pool.query(`UPDATE posts_v1 SET media_mime = '' WHERE media_mime IS NULL`);
+    await pool.query(
+      `UPDATE posts_v1 SET bucket = 'feed' WHERE bucket IS NULL OR bucket = ''`
+    );
+    await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN body SET NOT NULL`);
+    await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN media_mime SET NOT NULL`);
+    await pool.query(`ALTER TABLE posts_v1 ALTER COLUMN bucket SET NOT NULL`);
+
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS posts_v1_shop_bucket_created_idx ON posts_v1 (shop, bucket, created_at DESC, id DESC)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS posts_v1_customer_bucket_created_idx ON posts_v1 (customer_id, bucket, created_at DESC, id DESC)`
+    );
+
+    // Multi-media per post
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS post_media_v1 (
+        post_id BIGINT NOT NULL,
+        idx INT NOT NULL,
+        media_bytes BYTEA NOT NULL,
+        media_mime TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (post_id, idx)
+      );
+    `);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS post_media_v1_post_idx ON post_media_v1 (post_id)`
+    );
+
+    // Likes
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS likes_v1 (
+        shop TEXT NOT NULL,
+        post_id BIGINT NOT NULL,
+        customer_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (post_id, customer_id)
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS likes_v1_post_idx ON likes_v1 (post_id)`);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS likes_v1_customer_idx ON likes_v1 (customer_id)`
+    );
+
+    // Comments
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS comments_v1 (
+        id BIGSERIAL PRIMARY KEY,
+        shop TEXT NOT NULL,
+        post_id BIGINT NOT NULL,
+        customer_id TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET DEFAULT ''`);
+    await pool.query(`UPDATE comments_v1 SET body = '' WHERE body IS NULL`);
+    await pool.query(`ALTER TABLE comments_v1 ALTER COLUMN body SET NOT NULL`);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS comments_v1_post_created_idx ON comments_v1 (post_id, created_at ASC)`
+    );
+
+    // Follows
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS follows_v1 (
+        follower_id TEXT NOT NULL,
+        followed_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (follower_id, followed_id)
+      );
+    `);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS follows_v1_followed_idx ON follows_v1 (followed_id, created_at DESC)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS follows_v1_follower_idx ON follows_v1 (follower_id, created_at DESC)`
+    );
+
+    // Direct messages + media
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS messages_v1 (
+        id BIGSERIAL PRIMARY KEY,
+        shop TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        receiver_id TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await pool.query(`ALTER TABLE messages_v1 ALTER COLUMN body SET DEFAULT ''`);
+    await pool.query(`UPDATE messages_v1 SET body = '' WHERE body IS NULL`);
+    await pool.query(`ALTER TABLE messages_v1 ALTER COLUMN body SET NOT NULL`);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS messages_v1_pair_idx ON messages_v1 (sender_id, receiver_id, created_at DESC, id DESC)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS messages_v1_receiver_idx ON messages_v1 (receiver_id, created_at DESC, id DESC)`
+    );
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS message_media_v1 (
+        message_id BIGINT NOT NULL,
+        idx INT NOT NULL,
+        media_bytes BYTEA NOT NULL,
+        media_mime TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (message_id, idx)
+      );
+    `);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS message_media_v1_msg_idx ON message_media_v1 (message_id)`
+    );
+  })().catch((err) => {
+    schemaInitPromise = null;
+    throw err;
+  });
+
+  return schemaInitPromise;
 }
 
 /* ---------------------------
