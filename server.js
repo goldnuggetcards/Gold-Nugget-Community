@@ -1929,7 +1929,7 @@ proxy.get("/posts/:id/media/:idx", async (req, res) => {
   }
 });
 
-/** Backward compatible single media route (FIXED: no proxy.handle recursion) */
+/** Backward compatible single media route (no recursion) */
 proxy.get("/posts/:id/media", async (req, res) => {
   const customerId = getViewerCustomerId(req);
   if (!customerId) return res.status(200).type("text").send("Not logged in");
@@ -3177,16 +3177,29 @@ app.use("/proxy", proxy);
 
 app.use((req, res) => res.status(404).type("text").send("Not found"));
 
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on 0.0.0.0:${PORT}`);
-});
+let server = null;
+
+// Start: ensure schema once at boot (avoids first-request migrations)
+(async () => {
+  try {
+    if (pool) await ensureSchema();
+  } catch (e) {
+    console.error("ensureSchema boot error:", e);
+  }
+
+  server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server listening on 0.0.0.0:${PORT}`);
+  });
+})();
 
 process.on("SIGTERM", () => {
   console.log("SIGTERM received, shutting down...");
+  if (!server) process.exit(0);
   server.close(() => process.exit(0));
 });
 
 process.on("SIGINT", () => {
   console.log("SIGINT received, shutting down...");
+  if (!server) process.exit(0);
   server.close(() => process.exit(0));
 });
